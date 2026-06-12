@@ -1,0 +1,121 @@
+---
+title: "Scrapy 框架实战：从单机到分布式爬虫"
+slug: "scrapy-framework-guide"
+date: "2026-06-12"
+tags:
+  - Python
+  - 爬虫
+  - Scrapy
+  - 分布式
+category: "Python"
+excerpt: "Scrapy 是 Python 生态最成熟的爬虫框架。这篇从项目搭建讲到 Scrapy-Redis 分布式部署，一套代码管好大规模抓取。"
+published: true
+featured: true
+---
+
+## 为什么用 Scrapy
+
+当爬虫需要管理几十个页面规则、处理登录态、导出到数据库、定时调度时，用 `requests` 手写很快变成一团乱麻。Scrapy 提供了清晰的项目结构：
+
+```
+my_spider/
+├── spiders/        # 爬虫逻辑
+├── items.py        # 数据模型
+├── pipelines.py    # 数据处理与存储
+├── middlewares.py  # 中间件（代理、UA 轮换）
+└── settings.py     # 配置
+```
+
+## 快速上手
+
+```bash
+pip install scrapy
+scrapy startproject my_spider
+```
+
+写一个爬虫只需继承 `Spider` 类，定义起始 URL 和解析方法：
+
+```python
+import scrapy
+
+class QuoteSpider(scrapy.Spider):
+    name = "quotes"
+    start_urls = ["https://quotes.toscrape.com"]
+
+    def parse(self, response):
+        for quote in response.css("div.quote"):
+            yield {
+                "text": quote.css("span.text::text").get(),
+                "author": quote.css("small.author::text").get(),
+            }
+        # 自动翻页
+        next_page = response.css("li.next a::attr(href)").get()
+        if next_page:
+            yield response.follow(next_page, self.parse)
+```
+
+## Pipeline 处理数据
+
+Pipeline 是 Scrapy 的核心扩展点，每个 item 都会经过配置的 pipeline 链：
+
+```python
+class SaveToMySQLPipeline:
+    def open_spider(self, spider):
+        self.conn = mysql.connector.connect(host="localhost", database="scrapy")
+
+    def process_item(self, item, spider):
+        cursor = self.conn.cursor()
+        cursor.execute("INSERT INTO quotes (text, author) VALUES (%s, %s)",
+                       (item["text"], item["author"]))
+        self.conn.commit()
+        return item
+
+    def close_spider(self, spider):
+        self.conn.close()
+```
+
+## 中间件：代理与 UA
+
+反爬对抗放在 middlewares 里，和业务逻辑解耦：
+
+```python
+class RandomUserAgentMiddleware:
+    def process_request(self, request, spider):
+        request.headers["User-Agent"] = random.choice(USER_AGENTS)
+
+class ProxyMiddleware:
+    def process_request(self, request, spider):
+        request.meta["proxy"] = get_random_proxy()
+```
+
+## Scrapy-Redis 分布式
+
+当单机带宽和 IP 成为瓶颈时，用 Scrapy-Redis 实现分布式——多台机器共享一个请求队列：
+
+```bash
+pip install scrapy-redis
+```
+
+```python
+# settings.py
+SCHEDULER = "scrapy_redis.scheduler.Scheduler"
+DUPEFILTER_CLASS = "scrapy_redis.dupefilter.RFPDupeFilter"
+REDIS_URL = "redis://localhost:6379"
+```
+
+爬虫那边只需把继承类从 `Spider` 换成 `RedisSpider`：
+
+```python
+from scrapy_redis.spiders import RedisSpider
+
+class MyDistributedSpider(RedisSpider):
+    name = "distributed_spider"
+    redis_key = "spider:start_urls"
+    # 在 Redis 里 LPUSH spider:start_urls https://... 即可启动
+```
+
+多台机器同时运行同一个爬虫，它们从 Redis 队列里取 URL，互不冲突。
+
+## 总结
+
+Scrapy 的学习曲线比 `requests` 陡一点，但换来的是工程化的项目结构、内置的重试/去重/限速、以及方便的扩展机制。项目规模超过 5 个爬虫时，Scrapy 的优势就体现出来了。

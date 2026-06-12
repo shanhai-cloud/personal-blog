@@ -1,0 +1,135 @@
+---
+title: "Python 反爬突破：指纹伪装、代理池与验证码"
+slug: "python-anti-bot"
+date: "2026-06-12"
+tags:
+  - Python
+  - 爬虫
+  - 反爬
+  - Selenium
+  - 代理
+category: "Python"
+excerpt: "爬虫与反爬的对抗在不断升级。这篇整理了从 UA 轮换到浏览器指纹伪装再到验证码识别的完整应对方案。"
+published: true
+featured: true
+---
+
+## 爬虫与反爬的对抗阶梯
+
+反爬手段是层层递进的，对应的突破手段也是阶梯式的：
+
+| 防护等级 | 反爬手段 | 应对方案 |
+|----------|----------|----------|
+| L1 | User-Agent 检测 | UA 池轮换 |
+| L2 | IP 频率限制 | 代理池 + 限速 |
+| L3 | 请求头完整性校验 | 复制完整 headers |
+| L4 | JS 渲染 | Selenium / Playwright |
+| L5 | 浏览器指纹检测 | 指纹伪装工具 |
+| L6 | 验证码 | 识别服务 / 行为优化 |
+| L7 | 行为分析 | 模拟人类操作模式 |
+
+## L1–L3：请求层对抗
+
+### UA 池轮换
+
+```python
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120...",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Safari/605...",
+]
+
+session = requests.Session()
+session.headers.update({"User-Agent": random.choice(USER_AGENTS)})
+```
+
+### 代理池
+
+```python
+PROXIES = [
+    "http://proxy1:8080",
+    "http://proxy2:8080",
+]
+
+def get_with_proxy(url):
+    proxy = random.choice(PROXIES)
+    return requests.get(url, proxies={"http": proxy, "https": proxy}, timeout=10)
+```
+
+生产环境建议用收费代理服务（快代理、亿牛云），免费代理存活率太低。
+
+## L4–L5：浏览器层对抗
+
+### Selenium 无头模式
+
+```python
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+
+options = Options()
+options.add_argument("--headless")
+options.add_argument("--disable-blink-features=AutomationControlled")
+options.add_experimental_option("excludeSwitches", ["enable-automation"])
+
+driver = webdriver.Chrome(options=options)
+driver.get("https://target.com")
+```
+
+### Playwright 更现代的选择
+
+Playwright 比 Selenium 更现代，天然支持浏览器上下文的独立隔离：
+
+```python
+from playwright.sync_api import sync_playwright
+
+with sync_playwright() as p:
+    browser = p.chromium.launch(headless=True)
+    context = browser.new_context(
+        user_agent="Mozilla/5.0 ...",
+        viewport={"width": 1920, "height": 1080},
+    )
+    page = context.new_page()
+    page.goto("https://target.com")
+    content = page.content()
+    browser.close()
+```
+
+## L6：验证码处理
+
+验证码没有银弹，不同级别的验证码应对策略不同：
+
+- **简单数字验证码**：`ddddocr` 库可识别
+- **滑块验证码**：模拟轨迹拖动，`selenium` + 轨迹算法
+- **极验/腾讯验证码**：接入第三方打码平台
+
+```python
+import ddddocr
+
+ocr = ddddocr.DdddOcr()
+with open("captcha.png", "rb") as f:
+    result = ocr.classification(f.read())
+print(f"验证码识别结果: {result}")
+```
+
+## L7：行为模拟
+
+高级反爬系统会分析鼠标轨迹、滚动行为、按键间隔。应对策略是模拟真实用户：
+
+```python
+# 随机延迟，不要固定间隔
+import random
+import time
+
+time.sleep(random.uniform(1.5, 3.5))
+
+# Selenium 模拟鼠标移动
+from selenium.webdriver.common.action_chains import ActionChains
+
+actions = ActionChains(driver)
+actions.move_by_offset(100, 200).perform()
+time.sleep(0.3)
+actions.move_by_offset(50, -80).perform()
+```
+
+## 总结
+
+反爬对抗的核心原则是**匹配目标网站的防护等级**，不要过度设计。一个展示 API 的数据服务用 Selenium 反而更慢更脆弱。先试 requests，不行再加浏览器，逐级升级，够用就好。

@@ -1,0 +1,45 @@
+profile:
+  name: Shanhai
+  headline: 全栈开发工程师
+  location: 中国-济南
+  avatar: /images/profile/avatar.png
+  qrCode: /images/profile/qrcode.svg
+  followLabel: 关注微信公众号
+  followUrl: https://example.com/wechat
+  githubUrl: https://github.com/shanhai-cloud
+  messageUrl: https://example.com/message
+  rssUrl: /rss.xml
+
+navigation:
+  - href: /
+    label: 主页
+  - href: /categories
+    label: 分类
+  - href: /archives
+    label: 归档
+  - href: /about
+    label: 关于
+  - href: /projects
+    label: 开源项目
+
+links:
+  - title: Higress
+    domain: higress.cn
+    url: https://higress.cn
+  - title: Dubbo
+    domain: dubbo.apache.org
+    url: https://dubbo.apache.org
+  - title: Nacos
+    domain: nacos.io
+    url: https://nacos.io
+
+about:
+  title: 关于 Shanhai
+  description: >
+    大二在读，全栈开发工程师。目前已开发多个前后端项目，涵盖 Web 应用、API 服务和数据可视化。
+
+    现阶段主要学习 Python 爬虫和微服务架构，同时积累 Java 全栈开发经验。
+
+    博客主要记录爬虫技术、Java 开发、微服务实践和 AI 辅助编程方面的学习笔记与项目心得。
+
+    相信最好的学习方式就是动手写出来，所以有了这个博客。

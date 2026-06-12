@@ -1,0 +1,105 @@
+---
+title: "Python 爬虫入门：requests + BeautifulSoup 实战"
+slug: "python-scraping-basics"
+date: "2026-06-12"
+tags:
+  - Python
+  - 爬虫
+  - requests
+  - BeautifulSoup
+category: "Python"
+excerpt: "用 Python 写爬虫是最快上手的方式。这篇从环境搭建讲起，配合豆瓣 Top250 的实战案例，让你半小时内写出第一个爬虫。"
+published: true
+featured: true
+---
+
+## 准备工作
+
+Python 爬虫的最小依赖只有两个库：
+
+```bash
+pip install requests beautifulsoup4
+```
+
+- **requests**：发送 HTTP 请求，拿回 HTML
+- **BeautifulSoup**：解析 HTML，提取数据
+
+## 第一个爬虫：抓取豆瓣 Top250
+
+豆瓣 Top250 是一个经典的入门目标——页面结构简单，反爬策略温和。
+
+```python
+import requests
+from bs4 import BeautifulSoup
+
+url = "https://movie.douban.com/top250"
+headers = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+}
+
+resp = requests.get(url, headers=headers)
+soup = BeautifulSoup(resp.text, "html.parser")
+
+for item in soup.select("div.item"):
+    title = item.select_one("span.title").text
+    rating = item.select_one("span.rating_num").text
+    print(f"{title} - {rating}")
+```
+
+### 代码拆解
+
+1. **headers** 模拟浏览器发请求，很多网站会拦截裸 `requests`
+2. `BeautifulSoup(resp.text, "html.parser")` 把 HTML 解析成可操作的对象
+3. `soup.select()` 使用 CSS 选择器定位元素，和前端写法一致
+
+## 翻页处理
+
+豆瓣 Top250 的分页是 URL 参数 `?start=`，每页 25 条：
+
+```python
+for page in range(0, 250, 25):
+    url = f"https://movie.douban.com/top250?start={page}"
+    resp = requests.get(url, headers=headers)
+    soup = BeautifulSoup(resp.text, "html.parser")
+    # 解析逻辑...
+```
+
+## 数据持久化
+
+爬下来的数据要存起来，最轻量的方式是写 CSV：
+
+```python
+import csv
+
+with open("top250.csv", "w", newline="", encoding="utf-8") as f:
+    writer = csv.writer(f)
+    writer.writerow(["标题", "评分", "评价人数"])
+    writer.writerow([title, rating, reviewers])
+```
+
+数据量大了之后可以换 MySQL 或 MongoDB。
+
+## 异常处理
+
+爬虫一定会遇到网络波动和页面变化，不加异常处理的话跑一半就崩了：
+
+```python
+def safe_get(url, retries=3):
+    for i in range(retries):
+        try:
+            resp = requests.get(url, headers=headers, timeout=10)
+            resp.raise_for_status()
+            return resp.text
+        except Exception as e:
+            print(f"第 {i+1} 次重试: {e}")
+            time.sleep(1)
+    return None
+```
+
+## 总结
+
+入门爬虫记住三个要点：
+
+1. **先看再写**：打开浏览器开发者工具，搞清楚目标页面的结构再动手
+2. **温和请求**：设置合理的间隔、User-Agent、重试机制
+3. **循序渐进**：静态页面 → 动态页面 → 反爬对抗，不要一开始就上重型框架
