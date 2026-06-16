@@ -1,30 +1,37 @@
 ---
-title: 'Docker 部署与核心体系深入学习笔记'
-date: '2026-06-16'
-tags: ['Docker', 'DevOps', 'Deployment', 'Container']
-summary: '全面解析 Docker 常用指令、数据卷与挂载、Dockerfile 镜像构建以及 Docker Compose 多容器编排体系。'
+title: "Docker 部署与核心体系深入学习笔记"
+slug: "docker-deep-learning"
+date: "2026-06-16"
+tags:
+  - Docker
+  - DevOps
+  - Deployment
+  - Container
+category: "DevOps"
+excerpt: "全面解析 Docker 常用指令、数据卷与挂载、Dockerfile 镜像构建以及 Docker Compose 多容器编排体系。"
+published: true
 ---
-
-# Docker 部署与核心体系学习笔记
 
 Docker 是一个开源的应用容器引擎，它让开发者可以打包他们的应用以及依赖包到一个可移植的镜像中，然后发布到任何流行的 Linux 或 Windows 操作系统的机器上。本笔记将系统性地梳理 Docker 的核心技术体系。
 
 ---
 
-## 1. Docker 架构与核心概念
+## Docker 架构与核心概念
 
 在深入指令之前，我们需要明确 Docker 的三个核心概念：
-* **镜像 (Image)**：一个只读的模板，包含了运行应用程序所需的所有代码、运行时、库、环境变量和配置文件。
-* **容器 (Container)**：镜像的运行实例。它是独立运行的一个或一组应用。
-* **仓库 (Repository)**：集中存放镜像文件的地方，如 Docker Hub。
+
+- **镜像 (Image)**：一个只读的模板，包含了运行应用程序所需的所有代码、运行时、库、环境变量和配置文件。
+- **容器 (Container)**：镜像的运行实例。它是独立运行的一个或一组应用。
+- **仓库 (Repository)**：集中存放镜像文件的地方，如 Docker Hub。
 
 ---
 
-## 2. 详细常用指令
+## 常用指令速查
 
 以下是日常开发和部署中最常用的 Docker 命令分类速查。
 
-### 2.1 镜像管理
+### 镜像管理
+
 ```bash
 # 从注册表拉取镜像
 docker pull <image_name>:<tag>
@@ -38,9 +45,14 @@ docker rmi <image_id_or_name>
 # 强制删除镜像（即使有容器正在使用）
 docker rmi -f <image_id>
 
-# 清理无用的“悬空”镜像 (dangling images)
+# 清理无用的"悬空"镜像 (dangling images)
 docker image prune
-2.2 容器生命周期管理Bash# 创建并启动一个容器（后台运行）
+```
+
+### 容器生命周期管理
+
+```bash
+# 创建并启动一个容器（后台运行）
 # -d: 后台运行, -p: 端口映射[宿主机端口:容器端口], --name: 指定容器名
 docker run -d -p 8080:80 --name my_nginx nginx:latest
 
@@ -60,8 +72,13 @@ docker rm <container_id_or_name>
 
 # 清理所有处于终止状态的容器
 docker container prune
-2.3 运维与排错Bash# 查看容器运行日志
-# -f: 实时追踪, --tail 100: 仅查看最后100行
+```
+
+### 运维与排错
+
+```bash
+# 查看容器运行日志
+# -f: 实时追踪, --tail 100: 仅查看最后 100 行
 docker logs -f --tail 100 <container_id_or_name>
 
 # 进入正在运行的容器内部并开启交互式终端
@@ -74,7 +91,20 @@ docker inspect <container_id_or_name>
 
 # 查看容器的资源使用情况（CPU、内存、网络等）
 docker stats <container_id_or_name>
-3. 数据卷与挂载 (Data Volumes & Mounts)容器内部的数据是非持久化的，当容器被删除时，内部产生的数据也会随之丢失。为了实现数据持久化以及容器间的数据共享，Docker 提供了两种主要的数据挂载方式。3.1 匿名/具名数据卷 (Volumes)由 Docker 引擎自动在宿主机管理的文件系统区域（通常在 /var/lib/docker/volumes/）创建，受 Docker 完全管理，推荐使用。Bash# 创建一个具名数据卷
+```
+
+---
+
+## 数据卷与挂载
+
+容器内部的数据是非持久化的，当容器被删除时，内部产生的数据也会随之丢失。为了实现数据持久化以及容器间的数据共享，Docker 提供了两种主要的数据挂载方式。
+
+### 匿名 / 具名数据卷（Volumes）
+
+由 Docker 引擎自动在宿主机管理的文件系统区域（通常在 `/var/lib/docker/volumes/`）创建，受 Docker 完全管理，**推荐使用**。
+
+```bash
+# 创建一个具名数据卷
 docker volume create my_db_data
 
 # 查看所有数据卷
@@ -85,11 +115,52 @@ docker run -d -p 3306:3306 --name mysql_server \
   -v my_db_data:/var/lib/mysql \
   -e MYSQL_ROOT_PASSWORD=secret \
   mysql:8.0
-3.2 绑定挂载 (Bind Mounts)可以挂载宿主机上的任意绝对路径到容器内。更适合开发环境（例如挂载源代码实现热更新）或需要共享宿主机配置（如 nginx.conf）。Bash# 绑定挂载示例 (-v 宿主机绝对路径:容器内绝对路径)
+```
+
+### 绑定挂载（Bind Mounts）
+
+可以挂载宿主机上的任意绝对路径到容器内。更适合开发环境（例如挂载源代码实现热更新）或需要共享宿主机配置（如 nginx.conf）。
+
+```bash
+# 绑定挂载示例 (-v 宿主机绝对路径:容器内绝对路径)
 docker run -d -p 80:80 --name my_web \
   -v /var/www/html:/usr/share/nginx/html \
   nginx:latest
-💡 注意事项：使用 --mount 参数比 -v 语法更明确，推荐在复杂场景或集群部署（Swarm）中使用：--mount type=bind,source=/var/www/html,target=/usr/share/nginx/html如果挂载本地一个空目录到容器内已有内容的目录，Volume 会将容器内内容复制到本地，而 Bind Mount 会直接隐藏容器内原有的内容。4. Dockerfile 镜像构建体系Dockerfile 是一个文本文件，其中包含了一条条的指令，每一条指令构建一层，最终组合成一个完整的 Docker 镜像。4.1 常用指令详解指令作用示例说明FROM指定基础镜像FROM node:18-alpine必须作为第一条非注释指令WORKDIR设置工作目录WORKDIR /app后续指令（RUN, CMD等）都会在此目录下执行COPY复制本地文件到容器COPY . .推荐使用，仅复制本地文件ADD复制文件（支持URL与解压）ADD html.tar.gz /var/www/如果是本地压缩包会自动解压RUN构建时执行的 Shell 命令RUN npm install会在当前镜像层之上创建新的一层ENV设置环境变量ENV PORT=3000容器运行时及构建时均有效EXPOSE声明容器运行时监听的端口EXPOSE 3000仅起声明/文档作用，不会自动做端口映射CMD容器启动时默认执行的命令CMD ["npm", "start"]容易被 docker run 后面的参数覆盖ENTRYPOINT配置容器启动时的入口程序ENTRYPOINT ["node", "app.js"]不会被 docker run 覆盖，常与 CMD 配合使用4.2 高效的多阶段构建 (Multi-stage Builds) 示例多阶段构建可以显著减小最终镜像的体积。以下是一个前端 React/Vue 应用的多阶段构建编写模板：Dockerfile# --- 阶段一：构建阶段 ---
+```
+
+> 💡 **注意**：推荐使用 `--mount` 参数替代 `-v`，语法更明确，尤其适合复杂场景或集群部署（Swarm）：
+> ```
+> --mount type=bind,source=/var/www/html,target=/usr/share/nginx/html
+> ```
+>
+> 如果挂载本地一个空目录到容器内已有内容的目录，Volume 会将容器内内容复制到本地，而 Bind Mount 会直接隐藏容器内原有的内容。
+
+---
+
+## Dockerfile 镜像构建体系
+
+Dockerfile 是一个文本文件，其中包含了一条条的指令，每一条指令构建一层，最终组合成一个完整的 Docker 镜像。
+
+### 常用指令速查
+
+| 指令 | 作用 | 示例 | 说明 |
+|------|------|------|------|
+| `FROM` | 指定基础镜像 | `FROM node:18-alpine` | 必须作为第一条非注释指令 |
+| `WORKDIR` | 设置工作目录 | `WORKDIR /app` | 后续指令（RUN、CMD 等）都会在此目录下执行 |
+| `COPY` | 复制本地文件到容器 | `COPY . .` | 推荐使用，仅复制本地文件 |
+| `ADD` | 复制文件（支持 URL 与解压） | `ADD html.tar.gz /var/www/` | 如果是本地压缩包会自动解压 |
+| `RUN` | 构建时执行的 Shell 命令 | `RUN npm install` | 会在当前镜像层之上创建新的一层 |
+| `ENV` | 设置环境变量 | `ENV PORT=3000` | 容器运行时及构建时均有效 |
+| `EXPOSE` | 声明容器运行时监听的端口 | `EXPOSE 3000` | 仅起声明/文档作用，不会自动做端口映射 |
+| `CMD` | 容器启动时默认执行的命令 | `CMD ["npm", "start"]` | 容易被 `docker run` 后面的参数覆盖 |
+| `ENTRYPOINT` | 配置容器启动时的入口程序 | `ENTRYPOINT ["node", "app.js"]` | 不会被 `docker run` 覆盖，常与 CMD 配合使用 |
+
+### 多阶段构建示例
+
+多阶段构建可以显著减小最终镜像的体积。以下是一个前端 React/Vue 应用的多阶段构建模板：
+
+```dockerfile
+# --- 阶段一：构建阶段 ---
 FROM node:18-alpine AS builder
 WORKDIR /app
 COPY package*.json ./
@@ -103,9 +174,31 @@ FROM nginx:alpine
 COPY --from=builder /app/dist /usr/share/nginx/html
 EXPOSE 80
 CMD ["nginx", "-g", "daemon off;"]
-4.3 执行构建命令Bash# . 代表当前上下文路径，-t 用于指定镜像名和标签
+```
+
+### 执行构建命令
+
+```bash
+# . 代表当前上下文路径，-t 用于指定镜像名和标签
 docker build -t my-app:v1.0 .
-5. Docker Compose 多容器编排体系Docker Compose 是用于定义和运行多容器 Docker 应用程序的工具。通过一个 docker-compose.yml 配置文件，我们可以用一个命令配置并启动应用所需的所有服务。5.1 核心概念服务 (Services)：一个应用容器，例如 web、db。网络 (Networks)：将多个容器连接在同一个自定义网络中，使它们可以通过服务名互相通信。数据卷 (Volumes)：统一定义和管理数据持久化。5.2 docker-compose.yml 经典模板 (Node.js + Redis)YAMLversion: '3.8'
+```
+
+---
+
+## Docker Compose 多容器编排体系
+
+Docker Compose 是用于定义和运行多容器 Docker 应用程序的工具。通过一个 `docker-compose.yml` 配置文件，我们可以用一个命令配置并启动应用所需的所有服务。
+
+### 核心概念
+
+- **服务 (Services)**：一个应用容器，例如 `web`、`db`
+- **网络 (Networks)**：将多个容器连接在同一个自定义网络中，使它们可以通过服务名互相通信
+- **数据卷 (Volumes)**：统一定义和管理数据持久化
+
+### docker-compose.yml 经典模板（Node.js + Redis）
+
+```yaml
+version: '3.8'
 
 services:
   web:
@@ -137,7 +230,14 @@ volumes:
 networks:
   app-network:
     driver: bridge
-5.3 Docker Compose 常用指令请在包含 docker-compose.yml 文件的目录下执行以下命令：Bash# 后台启动并运行所有服务（如果镜像不存在会自动构建）
+```
+
+### Docker Compose 常用指令
+
+请在包含 `docker-compose.yml` 文件的目录下执行以下命令：
+
+```bash
+# 后台启动并运行所有服务（如果镜像不存在会自动构建）
 docker compose up -d
 
 # 构建或重新构建服务镜像
@@ -154,51 +254,14 @@ docker compose ps
 
 # 查看多容器整合的实时日志
 docker compose logs -f
+```
 
+---
 
+## 总结
 
+Docker 的核心学习路径可以概括为：
 
-
-
-
-
-
-docker inspect
-• docker inspect 是 Docker 调试和查看对象详情的核心命令
-• 可以查看容器、镜像、数据卷、网络等
-• 配合 -f 参数可以只显示需要的字段
-• 自定义挂载（绑定挂载）只能通过 docker inspect 查看，docker volume ls 看不到
-
-进入容器交互终端
-docker exec -it <容器名/ID> bash	进入容器的 bash 终端	适用于 Ubuntu、CentOS 等系统
-docker exec -it <容器名/ID> sh	进入容器的 sh 终端	适用于 Alpine 等精简系统
-docker attach <容器名/ID>	直接进入容器主进程的终端	退出会终止容器（除非加参数）
-
-查看容器信息
-docker ps	查看正在运行的容器
-docker ps -a	查看所有容器（包括已停止）
-docker inspect <容器名/ID>	查看容器详细信息（JSON）	可配合 grep 过滤关键字
-docker logs <容器名/ID>	查看容器日志
-docker logs -f <容器名/ID>	实时跟踪容器日志	类似 tail -f
-
-在容器内执行命令（不进入交互）
-docker exec <容器名/ID> <命令>	在容器内执行命令	docker exec dd ls /app
-docker exec -u <用户> <容器名/ID> <命令>	以指定用户执行命令	docker exec -u root dd whoami
-
-容器文件传输
-docker cp <本地路径> <容器名/ID>:<容器路径>	从主机复制文件到容器	docker cp ./test.txt dd:/tmp/
-docker cp <容器名/ID>:<容器路径> <本地路径>	从容器复制文件到主机	docker cp dd:/tmp/test.txt ./
-
-容器生命周期管理
-docker start <容器名/ID>	启动已停止的容器
-docker stop <容器名/ID>	停止运行中的容器
-docker restart <容器名/ID>	重启容器
-docker rm <容器名/ID>	删除容器（必须先停止）
-docker rm -f <容器名/ID>	强制删除运行中的容器
-
-
-加载一个已经打包好的 Docker 镜像到本地
-docker load -i xxx.tar
-
-仓库拉取镜像
-docker pull nacos/nacos-server:v2.3.2
+1. **先会用**：掌握 `run`、`ps`、`stop`、`logs`、`exec` 等基本命令
+2. **再会写**：能用 Dockerfile 把应用打包成镜像
+3. **最后编排**：用 Docker Compose 管理多容器应用
