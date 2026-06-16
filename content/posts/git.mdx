@@ -1,0 +1,308 @@
+---
+title: "Git 版本控制与工作流"
+slug: "git-deep-learning"
+date: "2026-06-16"
+tags:
+  - Git
+  - Version Control
+  - Workflow
+  - DevOps
+category: "DevOps"
+excerpt: "全面解析 Git 的工作区、暂存区和版本库三大核心区域，涵盖常用指令、分支管理、远程协同及冲突解决体系。"
+published: true
+---
+
+Git 是一个分布式版本控制系统，用于敏捷高效地处理任何或小或大的项目。理解 Git 的核心在于把握其"底层数据状态的流转"以及"分支的本质"。
+
+---
+
+## Git 三大核心区域
+
+Git 的底层运行完全基于三个区域的协同。理解文件在这三个区域之间的流转，就理解了 Git 80% 的日常操作。
+
+### 工作区（Working Directory）
+
+- **本质**：你在电脑里能看到的实际目录和文件
+- **文件状态**：在此区域的文件要么是**未追踪（Untracked）**的新文件，要么是**已修改（Modified）**但尚未暂存的老文件
+
+### 暂存区（Staging Area / Index）
+
+- **本质**：一个连接工作区和本地仓库的"缓存文件"，通常位于 `.git/index`
+- **类比**：像一个准备装箱的传送带——你把改好的文件一件件放上去，等待最后一次性的打包提交
+- **文件状态**：此区域的文件处于**已暂存（Staged）**状态
+
+### 本地版本库（Repository）
+
+- **本质**：Git 用于保存项目元数据和对象数据库的地方，位于 `.git/` 目录内
+- **文件状态**：此区域的文件处于**已提交（Committed）**状态
+- **数据安全性**：一旦数据进入这里，就意味着它已经生成了一个永久的历史快照。只要不删除 `.git` 文件夹，数据永不丢失
+
+### 三大区域流转图
+
+```
+工作区                    暂存区                    版本库
+Working Dir  --add-->  Staging Area  --commit-->  Repository
+    ^                                                   |
+    |------ checkout / restore / reset -----------------|
+```
+
+---
+
+## 常用指令速查
+
+以下按照文件在核心区域的流转逻辑，梳理日常开发高频指令。
+
+### 初始化与配置
+
+```bash
+# 在当前目录初始化一个新的 Git 仓库
+git init
+
+# 全局配置用户信息（每个 Commit 都会附带这些信息）
+git config --global user.name "Your Name"
+git config --global user.email "your.email@example.com"
+
+# 查看当前仓库的所有配置项
+git config --list
+```
+
+### 文件状态与流转（工作区 ⇄ 暂存区 ⇄ 版本库）
+
+```bash
+# 查看当前工作区和暂存区的文件状态（哪些改了、哪些没提交）
+git status
+
+# 查看工作区与暂存区的具体代码差异
+git diff
+
+# 【进暂存区】将指定文件或所有修改（.）提交到暂存区
+git add <file_name>
+git add .
+
+# 【出暂存区】将文件从暂存区撤回到工作区（保留修改）
+git restore --staged <file_name>
+
+# 【进版本库】将暂存区的内容提交到本地仓库，并记录提交信息
+git commit -m "feat: login boundary optimization"
+
+# 【跳过暂存区】直接将已追踪文件的修改提交到本地仓库
+git commit -am "fix: clean up console logs"
+```
+
+### 撤销与回滚操作
+
+```bash
+# 放弃工作区中某个文件的所有修改（危险操作，未提交的改动会丢失）
+git restore <file_name>
+
+# 修改上一次的提交信息（或者追加漏掉的暂存文件，不生成新 Commit）
+git commit --amend -m "correct: update previous commit message"
+
+# 【版本回退 - 软回退】回退到指定 Commit，保留工作区和暂存区的代码修改
+git reset --soft <commit_id>
+
+# 【版本回退 - 硬回退】彻底回退到指定 Commit，丢弃工作区和暂存区的所有修改（慎用！）
+git reset --hard <commit_id>
+
+# 查看所有的操作历史日志（即使被 reset 掉的 commit 也能在这里找到，用于恢复）
+git reflog
+```
+
+---
+
+## 分支管理体系
+
+在 Git 中，分支的本质仅仅是一个**指向特定 Commit 对象的轻量级可变指针**。创建分支几乎可以在毫秒级完成。
+
+### 分支基础操作
+
+```bash
+# 查看本地所有分支（当前分支前会有一个 * 号）
+git branch
+
+# 查看本地和远程的所有分支
+git branch -a
+
+# 创建一个新分支，但并不切换过去
+git branch <branch_name>
+
+# 切换到指定分支
+git checkout <branch_name>
+git switch <branch_name>
+
+# 创建并直接切换到新分支
+git checkout -b <branch_name>
+git switch -c <branch_name>
+
+# 删除本地分支（该分支必须已被合并）
+git branch -d <branch_name>
+
+# 强制删除本地分支（即使未合并）
+git branch -D <branch_name>
+```
+
+### Merge vs Rebase
+
+| 方式 | 原理 | 历史记录效果 | 适用场景 |
+|------|------|-------------|----------|
+| **Merge** | 将两个分支的最新快照及共同祖先进行三方合并，生成新的 Merge Commit | 树状分叉，真实完整 | 公共分支、团队协作 |
+| **Rebase** | 将当前分支上的提交复制到目标分支的最新提交之后 | 干净的直线 | 私人分支、整理本地历史 |
+
+```bash
+# 【Merge 方式】将 feature 分支的代码合并到当前分支
+git merge feature
+
+# 【Rebase 方式】将当前分支变基到 main 分支之上
+git rebase main
+
+# 挑拣特定的 Commit 合并到当前分支
+git cherry-pick <commit_id>
+```
+
+### Git Flow 工作流
+
+经典的分支管理模型，适合有明确发布周期的项目：
+
+```
+main     ───●──────────────●──────────●──── 生产环境
+              \            /
+develop  ──────●──●──●──●──●──●──●──●───── 开发主线
+                \    \       /
+feature/login ───●──●─●─────               功能分支
+                         \
+hotfix/urgent ────────────●──────────────── 紧急修复
+```
+
+**分支类型说明**：
+
+| 分支 | 前缀 | 说明 |
+|------|------|------|
+| **主分支** | `main` / `master` | 生产环境代码，只通过 PR 合并进入 |
+| **开发分支** | `develop` | 日常开发集成的主线 |
+| **功能分支** | `feature/xxx` | 从 develop 分出，完成后合并回 develop |
+| **修复分支** | `fix/xxx` | Bug 修复，合并回 develop |
+| **热修复** | `hotfix/xxx` | 紧急生产问题，从 main 分出，同时合并到 main 和 develop |
+
+---
+
+## 远程协同体系
+
+分布式版本控制的核心在于本地仓库与远程仓库（GitHub / GitLab / Gitee）的数据同步。
+
+```bash
+# 关联一个远程仓库并命名为 origin
+git remote add origin <remote_url>
+
+# 查看关联的远程仓库地址
+git remote -v
+
+# 从远程仓库拉取最新代码并与本地分支合并（等于 fetch + merge）
+git pull origin <branch_name>
+
+# 变基式的拉取代码（让本地提交线保持干净，推荐）
+git pull --rebase origin <branch_name>
+
+# 仅从远程下载最新分支与数据，但不自动合并本地代码
+git fetch origin
+
+# 将本地分支的提交推送到远程仓库
+git push origin <branch_name>
+
+# 第一次推送分支时，建立本地分支与远程分支的追踪关系
+git push -u origin <branch_name>
+
+# 删除远程分支
+git push origin --delete <branch_name>
+```
+
+### Pull Request / Merge Request 流程
+
+远程协同的标准操作流程，也是团队协作的核心：
+
+1. 从 `main` 创建 `feature/xxx` 分支
+2. 在 feature 分支上开发并提交
+3. Push 到远程仓库
+4. 在 GitHub / GitLab 上发起 PR / MR
+5. 团队成员 Code Review
+6. CI 自动化检查通过
+7. 合并到 `main`，删除 feature 分支
+
+---
+
+## 冲突解决体系
+
+当两个分支修改了同一个文件的同一行代码，并在合并（Merge/Rebase）时，Git 无法自动决定采用哪段代码，就会引发冲突。
+
+### 冲突时的文件状态
+
+Git 会直接修改冲突文件，并在文件中插入特殊的冲突标记：
+
+```
+<<<<<<< HEAD
+这里是你当前分支（当前指针所在位置）的代码
+=======
+这里是你要合并进来的分支（或者拉取下来的远程）的代码
+>>>>>>> feature-branch
+```
+
+### 解决冲突的标准流程
+
+1. **定位文件**：运行 `git status` 找到状态为 `both modified` 的文件
+2. **人工裁决**：打开文件，删掉 `<<<<<<<`、`=======`、`>>>>>>>` 这些标记，根据业务逻辑将代码修改为最终期望的状态
+3. **重新暂存**：运行 `git add <file_name>` 告诉 Git 冲突已解决
+4. **完成后续**：
+   - 如果是在 **merge** 期间：运行 `git commit -m "fix: resolve merge conflict"`
+   - 如果是在 **rebase** 期间：运行 `git rebase --continue`（**切记 rebase 期间不需要 commit**）
+
+---
+
+## 最佳实践建议
+
+1. **频繁提交，尽早推送**：一个小功能或一个修复就生成一个 Commit，保持 Commit 粒度原子化，切忌堆积一周的代码才提交一次
+
+2. **规范 Commit 消息**：推荐采用 Angular 规范
+
+   | 前缀 | 含义 | 示例 |
+   |------|------|------|
+   | `feat:` | 新功能 | `feat: add user login page` |
+   | `fix:` | 修 bug | `fix: correct typo in footer` |
+   | `docs:` | 改文档 | `docs: update API reference` |
+   | `style:` | 格式调整（不影响代码逻辑） | `style: format with prettier` |
+   | `refactor:` | 重构 | `refactor: extract auth middleware` |
+   | `test:` | 测试相关 | `test: add unit test for utils` |
+   | `chore:` | 构建/工具链变动 | `chore: update dependencies` |
+
+3. **不在公共主分支上直接开发**：永远在独立的 `feature/*` 或 `fix/*` 分支上工作，通过 Pull Request / Merge Request 合并入主分支
+
+4. **合理利用 `.gitignore`**：项目初始化时就配置好，将 `node_modules/`、`.env`、编译产物（`dist/`）和系统临时文件排除在版本控制之外
+
+5. **善用 `git stash`**：当你正在开发一个功能但需要临时切分支时：
+
+   ```bash
+   # 暂存当前工作区和暂存区的修改
+   git stash
+
+   # 切分支处理紧急问题
+   git checkout main
+   # ... 处理完后切回来
+
+   # 恢复之前暂存的修改
+   git stash pop
+
+   # 查看所有 stash 记录
+   git stash list
+   ```
+
+---
+
+## 总结
+
+Git 的学习路径可以概括为：
+
+1. **理解三区模型**：工作区 → 暂存区 → 版本库
+2. **掌握基本指令**：`status`、`add`、`commit`、`log`、`diff`
+3. **熟练分支操作**：`branch`、`checkout`、`merge`、`rebase`
+4. **学会远程协同**：`pull`、`push`、`fetch`、PR 流程
+5. **应对冲突**：理解冲突标记，掌握标准解决流程
+
+记住一个核心原则：**Git 几乎没有真正删除的操作，几乎所有误操作都可以恢复。** 善用 `git reflog`。
