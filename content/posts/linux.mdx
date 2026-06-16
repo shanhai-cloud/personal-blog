@@ -1,0 +1,352 @@
+---
+title: "Linux 系统架构与常用命令深入学习笔记"
+slug: "linux-deep-learning"
+date: "2026-06-16"
+tags:
+  - Linux
+  - OS
+  - DevOps
+  - SysAdmin
+category: "DevOps"
+excerpt: "全面解析 Linux 内核空间与用户空间隔离、文件系统层次结构、文件与权限管理、进程与网络系统运维核心体系。"
+published: true
+---
+
+Linux 是一种自由和开放源码的类 Unix 操作系统。理解 Linux 的核心在于把握其"一切皆文件"的设计哲学、用户空间与内核空间的严格物理隔离，以及清晰的文件系统层级结构。
+
+---
+
+## Linux 核心区域与空间划分
+
+Linux 的安全性和稳定性建立在严格的权限与空间隔离之上。
+
+### 用户空间（User Space）与内核空间（Kernel Space）
+
+| 空间 | 运行内容 | 权限 | 崩溃影响 |
+|------|----------|------|----------|
+| **用户空间** | 普通应用程序（Nginx、Node.js、Python 脚本、Bash Shell 等） | 受限内存访问，不能直接操作硬件 | 仅影响当前应用，不会导致系统崩溃 |
+| **内核空间** | Linux 操作系统核心（Kernel） | 至高无上，直接控制 CPU、内存、磁盘、网卡等所有硬件 | 内核崩溃 = 系统死机 |
+
+**系统调用（System Call）**：当用户空间的程序需要读取文件或发送网络包时，必须通过系统调用向内核发起请求。这是两个空间之间唯一的合法通道。
+
+```
+用户空间程序 → 系统调用 → 内核空间 → 硬件
+                         ↑
+                      权限检查
+```
+
+---
+
+## 文件系统层次结构（FHS）
+
+Linux 没有 Windows 那样的 C 盘、D 盘概念，所有文件和硬件设备都挂载在单一的**根目录 `/`** 之下。
+
+| 目录 | 用途 | 典型内容 |
+|------|------|----------|
+| `/bin` `/sbin` | 核心可执行命令 | `ls`、`cp`、`mount`等，`sbin` 仅供 Root |
+| `/etc` | **所有配置文件** | `/etc/nginx/nginx.conf`、`/etc/ssh/sshd_config` |
+| `/var` | 经常变动的文件 | **日志 (`/var/log/`)**、缓存、邮件队列 |
+| `/home` `/root` | 用户家目录 | 普通用户在 `/home/user/`，Root 在 `/root/` |
+| `/tmp` | 临时文件 | 重启后通常清空 |
+| `/proc` `/sys` | **虚拟文件系统** | 不占磁盘空间，直接映射内核运行状态 |
+| `/dev` | 设备文件 | 硬盘 `/dev/sda`、终端 `/dev/tty` |
+| `/opt` | 第三方软件 | 手动安装的大型软件 |
+| `/usr` | 用户程序和数据 | `/usr/bin/`、`/usr/lib/` |
+
+> **核心思想**：改配置去 `/etc`，查日志去 `/var/log`，看系统状态去 `/proc`。
+
+---
+
+## 常用指令速查
+
+### 文件与目录操作
+
+```bash
+# 查看当前所在路径的绝对路径
+pwd
+
+# 列出当前目录下的文件
+# -l: 详细列表, -a: 显示包含 . 开头的隐藏文件, -h: 以易读的格式显示大小（如 K, M）
+ls -lah
+
+# 切换目录
+cd /etc/nginx
+
+# 创建多级目录（如果父目录不存在会自动创建）
+mkdir -p /data/www/html
+
+# 复制文件或目录（-r 用于递归复制整个目录）
+cp -r /source/dir /target/dir
+
+# 移动或重命名文件/目录
+mv old_name.txt new_name.txt
+
+# 强制删除文件或目录（危险操作，没有回收站！）
+rm -rf /path/to/delete
+```
+
+### 文本查看与流处理
+
+```bash
+# 查看文件全部内容（适合小文件）
+cat app.log
+
+# 分页查看大文件内容（空格翻页，q 键退出）
+less production.log
+
+# 实时追踪查看文件的最后 100 行内容（排查线上日志必备）
+tail -f -n 100 error.log
+
+# 【强大的文本过滤】在文件中搜索包含 "ERROR" 的行
+grep "ERROR" app.log
+
+# 结合管道符（|）将前一个命令的输出传递给 grep 过滤
+cat app.log | grep "Exception" | wc -l
+
+# 更多管道组合示例——统计前 10 个访问最多的 IP
+cat access.log | awk '{print $1}' | sort | uniq -c | sort -rn | head -10
+```
+
+### 三个经典文本处理命令对比
+
+| 命令 | 作用 | 常见用法 |
+|------|------|----------|
+| `grep` | 行过滤 | `grep "ERROR" log` |
+| `awk` | 按列提取 | `awk '{print $1}'` 取第一列 |
+| `sed` | 流编辑 | `sed 's/old/new/g'` 全局替换 |
+
+---
+
+## 用户与权限管理
+
+Linux 的权限分为三组，每组拥有读（r=4）、写（w=2）、执行（x=1）权限。
+
+```
+文件权限示例：-rwxr-xr-x  1 nginx www-data 4096 Jun 16 10:00 run.sh
+              ─┬─ ─┬─ ─┬─
+              属主 属组 其他人
+              rwx  r-x  r-x
+               7    5    5   → 数字表示：755
+```
+
+```bash
+# 修改文件所有者（将文件归属改为 nginx 用户）
+chown nginx:nginx index.html
+
+# 修改文件权限
+# 755 代表：属主可读写执行(4+2+1=7)，属组可读执行(4+1=5)，其他人可读执行(4+1=5)
+chmod 755 run.sh
+
+# 临时提升为 Root 超级管理员权限执行命令
+sudo systemctl restart nginx
+```
+
+### 权限数字速查表
+
+| 数字 | 二进制 | 权限 | 含义 |
+|------|--------|------|------|
+| 7 | 111 | `rwx` | 读 + 写 + 执行 |
+| 6 | 110 | `rw-` | 读 + 写 |
+| 5 | 101 | `r-x` | 读 + 执行 |
+| 4 | 100 | `r--` | 只读 |
+| 0 | 000 | `---` | 无权限 |
+
+---
+
+## 系统状态与运维排错体系
+
+当服务器遭遇性能瓶颈（慢、卡顿、断连）时，通过以下体系化的命令进行排查。
+
+### 进程与 CPU / 内存监控
+
+```bash
+# 查看动态的系统资源占用排行榜（交互式，按 q 退出）
+top
+
+# htop 比 top 更友好（彩色界面，鼠标支持）
+htop
+
+# 查看静态的系统当前所有进程快照
+ps -ef
+
+# 组合拳：查找特定服务的进程 ID (PID)
+ps -ef | grep node
+
+# 强制杀死指定 PID 的进程
+kill -9 <PID>
+
+# 查看内存使用情况（-m 以 MB 为单位，-h 易读格式）
+free -h
+```
+
+### top 输出关键指标解读
+
+```
+top - 10:30:15 up 30 days, 2 users, load average: 0.05, 0.10, 0.15
+      ─────── ────────              ──────────────────────────
+      当前时间  运行时长                 1/5/15 分钟平均负载
+Tasks: 120 total, 1 running, 119 sleeping
+%Cpu(s):  2.5 us,  1.0 sy,  0.0 ni, 96.5 id
+         用户态  内核态   低优先级  空闲(越高越好)
+MiB Mem:   3900 total,  2100 used,  1800 free
+```
+
+**平均负载（load average）** 是核心指标：三个数字分别代表过去 1/5/15 分钟的平均负载。如果数值持续大于 CPU 核心数，说明系统过载。
+
+### 磁盘与存储排查
+
+```bash
+# 查看各个磁盘分区的空间使用率（排查磁盘是否被日志塞满）
+df -h
+
+# 查看当前目录下各个文件和文件夹所占用的实际磁盘大小
+du -sh *
+
+# 找出当前目录下最大的 5 个文件/文件夹
+du -sh * | sort -rh | head -5
+```
+
+### 网络连接与端口排查
+
+```bash
+# 查看网络接口（IP 地址、网卡信息）
+ip addr
+
+# 测试与目标主机的网络连通性
+ping 8.8.8.8
+
+# 排查端口占用情况
+# -t: tcp, -u: udp, -l: 监听状态, -n: 显示数字端口, -p: 显示进程 PID
+ss -tulnp
+netstat -tulnp
+
+# 查看当前服务器的并发连接状态统计
+ss -s
+
+# 测试远程端口是否开放
+telnet 192.168.1.1 3306
+nc -zv 192.168.1.1 3306
+```
+
+---
+
+## 现代 Linux 服务管理体系（Systemd）
+
+在现代 Linux 发行版（Ubuntu、CentOS、Debian）中，Systemd 是初始化和管理系统服务的标准工具。
+
+```bash
+# 启动 / 停止 / 重启服务
+sudo systemctl start docker
+sudo systemctl stop docker
+sudo systemctl restart docker
+
+# 重新加载配置文件（不中断服务）
+sudo systemctl reload nginx
+
+# 查看服务当前的运行状态、PID 以及最新几行日志
+systemctl status nginx
+
+# 设置服务在开机时自动启动
+sudo systemctl enable nginx
+
+# 取消服务的开机自启
+sudo systemctl disable nginx
+
+# 查看系统服务启动失败的日志
+journalctl -u nginx.service --no-pager -n 20
+
+# 查看所有已启用的开机自启服务
+systemctl list-unit-files --state=enabled
+```
+
+---
+
+## 文本处理三剑客速查
+
+### grep — 行过滤
+
+```bash
+# 基本搜索
+grep "error" app.log
+
+# 忽略大小写
+grep -i "error" app.log
+
+# 显示匹配行的行号
+grep -n "error" app.log
+
+# 反向匹配（排除包含某关键词的行）
+grep -v "DEBUG" app.log
+
+# 递归搜索目录下所有文件
+grep -r "TODO" ./src/
+```
+
+### awk — 按列处理
+
+```bash
+# 打印第一列和第三列（默认按空格/Tab 分隔）
+awk '{print $1, $3}' access.log
+
+# 按逗号分隔，打印第二列
+awk -F',' '{print $2}' data.csv
+
+# 统计第二列的总和
+awk '{sum += $2} END {print sum}' data.txt
+```
+
+### sed — 流编辑器
+
+```bash
+# 全局替换文本
+sed 's/old/new/g' file.txt
+
+# 删除包含某关键词的行
+sed '/error/d' app.log
+
+# 只打印第 10 到 20 行
+sed -n '10,20p' file.txt
+
+# 原地修改文件（要小心）
+sed -i 's/old/new/g' file.txt
+```
+
+---
+
+## 最佳实践建议
+
+1. **最小权限原则**：永远不要直接使用 root 用户进行日常业务代码的开发与部署。应当为每个应用创建独立的低权限系统用户（如 `www-data` 或 `nginx`）
+
+2. **日志轮转（Logrotate）**：生产环境下的应用日志必须配置自动切分与清理，否则日志文件会随着时间推移占满服务器磁盘，导致系统挂起
+
+   ```bash
+   # 检查已有日志轮转配置
+   cat /etc/logrotate.d/nginx
+   ```
+
+3. **善用 SSH 密钥认证**：关闭服务器的 SSH 密码登录，统一改为公私钥配对（SSH Key）登录，并将默认的 22 端口改为其他高位端口，防范自动化暴力破解
+
+4. **定期清理缓存与临时文件**：注意 `/tmp` 目录的清理，熟练使用以下命令定期销毁历史过期文件：
+
+   ```bash
+   # 删除 30 天前的日志文件
+   find /var/log -type f -mtime +30 -delete
+
+   # 查找大于 100M 的文件
+   find / -type f -size +100M 2>/dev/null
+   ```
+
+5. **掌握管道思想**：Linux 的哲学是小而美的工具组合——每个命令只做一件事，用管道 `|` 串联起来完成复杂任务。
+
+---
+
+## 总结
+
+Linux 的学习路径可以概括为：
+
+1. **理解空间隔离**：用户空间 vs 内核空间，知道系统调用是唯一通道
+2. **熟悉 FHS 目录结构**：改配置去 `/etc`，查日志去 `/var/log`，看状态去 `/proc`
+3. **掌握文件操作**：`ls`、`cd`、`cp`、`mv`、`chmod`、`chown`
+4. **会用文本三剑客**：`grep` 过滤行，`awk` 提取列，`sed` 编辑流
+5. **学会系统排错**：`top`/`ps` 看进程，`df`/`du` 查磁盘，`ss`/`netstat` 查端口
+6. **管理服务**：`systemctl` 启动/停止/开机自启
