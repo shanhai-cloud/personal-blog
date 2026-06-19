@@ -52,9 +52,9 @@ published: true
 
 ---
 
-## 一、从单体到微服务：架构演进的内在逻辑
+## 从单体到微服务：架构演进的内在逻辑
 
-### 1.1 单体架构的黄金时代与必然瓶颈
+### 单体架构的黄金时代与必然瓶颈
 
 早期项目通常采用单体架构，所有模块部署在同一个 JVM 中：
 
@@ -99,7 +99,7 @@ Mall ── 一个 War/Jar 包
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-### 1.2 微服务的核心思想
+### 微服务的核心思想
 
 > **一个服务只负责一个业务能力，独立开发、独立部署、独立扩容、独立数据库。**
 
@@ -126,7 +126,7 @@ logistics-service → 自有数据库（logistics_db）
 
 ---
 
-## 二、CAP 理论：分布式系统第一性原理
+## CAP 理论：分布式系统第一性原理
 
 所有分布式架构决策的本质，都是在 CAP 三角中做取舍：
 
@@ -144,7 +144,7 @@ logistics-service → 自有数据库（logistics_db）
 - **A（可用性）**：每个请求都能收到一个非错误的响应（但不保证是最新数据）
 - **P（分区容忍性）**：系统在出现网络分区时仍能继续运作
 
-### 2.1 为什么 P 是必选项？
+### 为什么 P 是必选项？
 
 网络一定会出问题——这是分布式系统的物理定律：
 
@@ -158,7 +158,7 @@ CP 选择（放弃 A）：拒绝写入，保证所有节点数据一致
 AP 选择（放弃 C）：允许写入，分区恢复后再同步
 ```
 
-### 2.2 Nacos 的双模设计：同时支持 AP 和 CP
+### Nacos 的双模设计：同时支持 AP 和 CP
 
 Nacos 的核心设计精髓在于区分了**临时实例**和**永久实例**：
 
@@ -178,9 +178,9 @@ spring:
 
 ---
 
-## 三、Nacos 注册中心：服务寻址的根基
+## Nacos 注册中心：服务寻址的根基
 
-### 3.1 为什么需要注册中心？
+### 为什么需要注册中心？
 
 ```
 传统硬编码方式：
@@ -195,7 +195,7 @@ spring:
    只需服务名，其余由注册中心 + 负载均衡自动处理
 ```
 
-### 3.2 服务注册与发现的完整流程
+### 服务注册与发现的完整流程
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
@@ -224,7 +224,7 @@ spring:
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-### 3.3 核心配置
+### 核心配置
 
 ```yaml
 # user-service 的 bootstrap.yml
@@ -240,7 +240,7 @@ spring:
         cluster-name: HZ        # 集群名（同集群优先调用）
 ```
 
-### 3.4 Nacos 配置中心
+### Nacos 配置中心
 
 注册中心解决了"找得到"，配置中心解决了"改得动"。Nacos 将两者合二为一：
 
@@ -278,9 +278,9 @@ public class UserController {
 
 ---
 
-## 四、OpenFeign：声明式服务调用
+## OpenFeign：声明式服务调用
 
-### 4.1 为什么不用 RestTemplate？
+### 为什么不用 RestTemplate？
 
 ```java
 // RestTemplate 方式：大量硬编码 + 字符串拼接
@@ -298,7 +298,7 @@ public interface UserClient {
 User user = userClient.findById(1L); // 一行搞定
 ```
 
-### 4.2 OpenFeign 底层原理
+### OpenFeign 底层原理
 
 ```
 userClient.findById(1L)
@@ -319,7 +319,7 @@ userClient.findById(1L)
   接收 Response → 反序列化为 User 对象
 ```
 
-### 4.3 生产级配置与拦截器
+### 生产级配置与拦截器
 
 ```java
 // 请求拦截器：自动透传认证 Token
@@ -377,9 +377,9 @@ public class UserClientFallbackFactory implements FallbackFactory<UserClient> {
 
 ---
 
-## 五、Spring Cloud Gateway：API 网关
+## Spring Cloud Gateway：API 网关
 
-### 5.1 网关的四大核心职责
+### 网关的四大核心职责
 
 ```
                     ┌─────────────────┐
@@ -391,7 +391,7 @@ public class UserClientFallbackFactory implements FallbackFactory<UserClient> {
                     └─────────────────┘
 ```
 
-### 5.2 路由配置
+### 路由配置
 
 ```yaml
 spring:
@@ -424,7 +424,7 @@ spring:
             - Path=/ws/**
 ```
 
-### 5.3 全局过滤器：统一鉴权
+### 全局过滤器：统一鉴权
 
 ```java
 @Component
@@ -476,9 +476,9 @@ public class AuthGlobalFilter implements GlobalFilter {
 
 ---
 
-## 六、RabbitMQ：消息驱动的服务解耦
+## RabbitMQ：消息驱动的服务解耦
 
-### 6.1 同步 vs 异步：一个下单场景的对比
+### 同步 vs 异步：一个下单场景的对比
 
 ```
 同步调用（阻塞等待，耗时累加）：
@@ -492,7 +492,7 @@ public class AuthGlobalFilter implements GlobalFilter {
         ↑ 订单接口 50ms 返回
 ```
 
-### 6.2 RabbitMQ 五种交换机与路由模型
+### RabbitMQ 五种交换机与路由模型
 
 | 模型 | 交换机类型 | 路由逻辑 | 典型场景 |
 |------|-----------|----------|----------|
@@ -502,7 +502,7 @@ public class AuthGlobalFilter implements GlobalFilter {
 | **Direct** | `direct` | 按 Routing Key 精确匹配 | 按业务类型路由 |
 | **Topic** | `topic` | 按通配符模糊匹配（`*` `#`） | **企业最常用**，灵活路由 |
 
-### 6.3 Topic 模式：企业最常用
+### Topic 模式：企业最常用
 
 ```java
 @Configuration
@@ -545,7 +545,7 @@ public class RabbitMqTopicConfig {
 }
 ```
 
-### 6.4 消息可靠性保障三件套
+### 消息可靠性保障三件套
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
@@ -592,7 +592,7 @@ public class OrderCreateConsumer {
 }
 ```
 
-### 6.5 延时队列（基于死信交换机 + TTL）
+### 延时队列（基于死信交换机 + TTL）
 
 ```java
 // 下单 30 分钟未支付 → 自动取消
@@ -616,9 +616,9 @@ public void handleOrderCancel(OrderMessage message) {
 
 ---
 
-## 七、Sentinel：流量治理的最后一道防线
+## Sentinel：流量治理的最后一道防线
 
-### 7.1 Sentinel 的三大核心能力
+### Sentinel 的三大核心能力
 
 ```
 ┌──────────────────────────────────────────────────────┐
@@ -635,7 +635,7 @@ public void handleOrderCancel(OrderMessage message) {
 └──────────────────────────────────────────────────────┘
 ```
 
-### 7.2 代码实现
+### 代码实现
 
 ```java
 @Service
@@ -666,7 +666,7 @@ public class OrderService {
 }
 ```
 
-### 7.3 Sentinel 控制台规则配置
+### Sentinel 控制台规则配置
 
 ```
 Sentinel Dashboard（sentinel-dashboard.jar）→ 可视化配置规则
@@ -687,7 +687,7 @@ Sentinel Dashboard（sentinel-dashboard.jar）→ 可视化配置规则
   最小请求数：5
 ```
 
-### 7.4 网关层 + Sentinel 联动
+### 网关层 + Sentinel 联动
 
 ```yaml
 spring:
@@ -708,9 +708,9 @@ spring:
 
 ---
 
-## 八、Seata：分布式事务的工程解法
+## Seata：分布式事务的工程解法
 
-### 8.1 分布式事务的经典困境
+### 分布式事务的经典困境
 
 ```
 下单流程涉及 3 个独立的数据库：
@@ -725,7 +725,7 @@ spring:
 
 `@Transactional` 只能控制**一个数据库**，跨服务跨库时无能为力。
 
-### 8.2 Seata AT 模式：最广泛使用的方案
+### Seata AT 模式：最广泛使用的方案
 
 Seata 架构三要素：
 
@@ -761,7 +761,7 @@ Seata 架构三要素：
   任一失败 → TC 通知各 RM 根据 Undo Log 反向补偿回滚
 ```
 
-### 8.3 核心配置
+### 核心配置
 
 ```yaml
 spring:
@@ -816,7 +816,7 @@ public class OrderServiceImpl implements OrderService {
 }
 ```
 
-### 8.4 Seata 模式对比
+### Seata 模式对比
 
 | 模式 | 原理 | 性能 | 侵入性 | 适用场景 |
 |------|------|------|--------|----------|
@@ -827,9 +827,9 @@ public class OrderServiceImpl implements OrderService {
 
 ---
 
-## 九、可观测性：生产环境的眼睛
+## 可观测性：生产环境的眼睛
 
-### 9.1 三大支柱
+### 三大支柱
 
 | 维度 | 解决的问题 | 技术选型 |
 |------|-----------|----------|
@@ -837,7 +837,7 @@ public class OrderServiceImpl implements OrderService {
 | **指标（Metrics）** | 系统整体有多健康？ | Prometheus + Grafana |
 | **链路追踪（Tracing）** | 一个请求在分布式系统中如何流转？ | SkyWalking / Zipkin |
 
-### 9.2 SkyWalking 链路追踪
+### SkyWalking 链路追踪
 
 ```
 用户请求 /order/create
@@ -858,7 +858,7 @@ public class OrderServiceImpl implements OrderService {
 
 ---
 
-## 十、企业级微服务实践清单
+## 企业级微服务实践清单
 
 ### 服务拆分原则
 
