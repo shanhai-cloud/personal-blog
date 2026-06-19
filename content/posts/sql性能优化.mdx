@@ -1,0 +1,557 @@
+---
+title: "MySQL 进阶：慢查询排查、EXPLAIN 诊断与索引失效深度优化指南"
+slug: "sql-performance-optimization"
+date: "2026-06-19"
+tags:
+  - MySQL
+  - Database
+  - SQL-Optimization
+  - DevOps
+category: "数据库"
+excerpt: "解构 MySQL 性能优化黄金链路，详解 EXPLAIN 执行计划核心参数，死磕索引失效七大经典场景，覆盖 JOIN 优化、深分页修复与 ORDER BY 排序内核。"
+published: true
+---
+
+MySQL 性能优化的核心逻辑可以概括为：**精准定位慢 SQL → 利用执行计划诊断内核缺陷 → 遵循最左前缀与覆盖索引原则调优 → 杜绝索引失效**。本文将沿着这条黄金链路，逐层深入。
+
+---
+
+## 性能排查三步走：定位 → 剖析 → 诊断
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                    MySQL 性能排查黄金链路                            │
+│                                                                  │
+│  ┌──────────────┐    ┌──────────────────┐    ┌──────────────┐    │
+│  │  第一步：定位   │ → │   第二步：剖析      │ → │  第三步：诊断  │    │
+│  │              │    │                  │    │              │    │
+│  │  慢查询日志    │    │  SHOW PROFILE    │    │   EXPLAIN    │    │
+│  │  找到"谁慢"    │    │  找到"慢在哪里"    │    │  找到"为什么慢" │    │
+│  └──────────────┘    └──────────────────┘    └──────────────┘    │
+│                                                                  │
+│  输出：具体 SQL      输出：耗时阶段分布      输出：执行计划 + 优化方案 │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### 第一步：开启慢查询日志 — 定位"谁慢"
+
+首先通过全局状态判断数据库的负载特征：
+
+```sql
+-- 查看当前数据库是以查询为主还是增删改为主
+-- Com_______ 是 7 个下划线，分别对应 select/insert/update/delete/replace/...
+SHOW GLOBAL STATUS LIKE 'Com_______';
+```
+
+在 `/etc/my.cnf` 中配置慢查询日志：
+
+```ini
+[mysqld]
+# 开启慢查询日志总开关
+slow_query_log = 1
+# 慢查询日志文件路径
+slow_query_log_file = /var/log/mysql/slow.log
+# 慢查询阈值（单位：秒），超过此值的 SQL 将被记录
+long_query_time = 2
+# 记录未使用索引的查询（可选，线上谨慎开启）
+log_queries_not_using_indexes = 0
+```
+
+配置完成后验证：
+
+```sql
+SHOW VARIABLES LIKE 'slow_query_log%';
+SHOW VARIABLES LIKE 'long_query_time';
+```
+
+### 第二步：SHOW PROFILE — 剖析"慢在哪里"
+
+慢查询日志告诉你**谁慢**，而 Profiling 告诉你**慢在哪个阶段**：
+
+```sql
+-- 1. 检查当前 MySQL 是否支持 profiling
+SELECT @@have_profiling;
+
+-- 2. 开启 profiling（会话级别）
+SET profiling = 1;
+
+-- 3. 执行你的业务 SQL
+SELECT * FROM tb_user WHERE phone = '17799990010';
+
+-- 4. 查看当前会话中所有 SQL 的耗时快照
+SHOW PROFILES;
+
+-- 5. 针对某一特定 Query ID，查看其生命周期的精确耗时分布
+SHOW PROFILE FOR QUERY 1;
+
+-- 6. 查看 CPU、I/O、内存等详细资源消耗
+SHOW PROFILE CPU, BLOCK IO, MEMORY FOR QUERY 1;
+```
+
+| 耗时阶段 | 含义 | 重点关注 |
+|----------|------|----------|
+| `Sending data` | 从存储引擎读取数据并返回给客户端 | 数值过大 = 回表过多/数据量大 |
+| `Creating sort index` | 在内存/磁盘中创建排序索引 | 出现即说明 ORDER BY 未走索引 |
+| `Creating tmp table` | 创建临时表（GROUP BY/DISTINCT 等） | 内存临时表还好，磁盘临时表灾难 |
+| `Sorting result` | 对结果集排序 | 配合 `Creating sort index` 分析 |
+| `converting HEAP to MyISAM` | 内存临时表溢出转为磁盘表 | **严重性能杀手** |
+
+### 第三步：EXPLAIN 执行计划 — 诊断"为什么慢"
+
+对于定位到的慢 SQL，在前面加上 `EXPLAIN` 关键字，直接查看 MySQL 优化器的执行方案：
+
+```sql
+EXPLAIN SELECT id, name FROM tb_user WHERE phone = '17799990010';
+```
+
+---
+
+## EXPLAIN 核心字段逐列拆解
+
+执行计划返回的结果中，有五个字段直接决定了 SQL 的生死：
+
+```
+EXPLAIN 结果 →
+┌──────────┬───────────┬──────┬──────┬─────────┬──────┬──────┬──────┐
+│    id    │ select_   │table │ type │possible_│ key  │key_  │ ref  │ ...
+│          │  type     │      │      │  keys   │      │ len  │      │
+└──────────┴───────────┴──────┴──────┴─────────┴──────┴──────┴──────┘
+                                                      ↓
+                                                ┌──────┬─────────────┐
+                                                │ rows │    Extra    │
+                                                └──────┴─────────────┘
+```
+
+### type — 访问类型（性能从优到差）
+
+| 级别 | type 值 | 含义 | 常见触发条件 |
+|------|---------|------|-------------|
+| 🟢 极优 | `system` | 系统表，仅一行 | 极少见 |
+| 🟢 极优 | `const` | 主键或唯一索引等值匹配 | `WHERE id = 1` |
+| 🟢 优秀 | `eq_ref` | 联表查询中，驱动表的每一行在被驱动表中有且仅有一条匹配 | 联表 ON 条件是主键/唯一键 |
+| 🟡 良好 | `ref` | 非唯一索引等值匹配 | `WHERE name = 'Tom'` |
+| 🟡 良好 | `range` | 索引范围扫描 | `WHERE age > 20`、`BETWEEN`、`IN`、`LIKE '张%'` |
+| 🟠 较差 | `index` | 全索引扫描 | `SELECT name FROM users`（仅查索引列也走全索引） |
+| 🔴 灾难 | **`ALL`** | **全表扫描** | 未命中任何索引，磁盘 I/O 爆炸 |
+
+**硬性准则**：线上业务 SQL 的 type 不得低于 `range`，出现 `ALL` 必须优化。
+
+### key — 实际使用的索引
+
+```sql
+-- key 列为 NULL：未使用任何索引 → 必须优化
+-- key 列有值（如 idx_phone）：使用了该索引 → 结合 key_len 判断用了几列
+```
+
+### key_len — 索引使用的字节数
+
+`key_len` 可以精确反映**联合索引用了几列**：
+
+```sql
+-- 假设联合索引 INDEX(name, age, phone)
+-- name VARCHAR(50) utf8mb4 → 50*4+2 = 202 字节
+-- age INT                    → 4+1 = 5 字节（默认允许 NULL 加 1）
+-- phone CHAR(11) utf8mb4    → 11*4 = 44 字节
+
+-- key_len = 202 → 仅用了 name 列
+-- key_len = 207 → 用了 name + age 列
+-- key_len = 251 → 用了 name + age + phone 列
+```
+
+### rows — 预估扫描行数
+
+MySQL 优化器基于统计信息估算的扫描行数，**越小越好**。如果 `rows=100000` 而实际只需要 1 行，说明索引选择出了问题。
+
+### Extra — 额外信息（重点关注）
+
+| Extra 值 | 含义 | 是好是坏 |
+|-----------|------|----------|
+| `Using index` | **覆盖索引**：所需数据全在索引树上，无需回表 | 🟢 **最优，追求目标** |
+| `Using index condition` | **索引下推（ICP）**：存储引擎层先过滤，再送回 Server 层 | 🟢 良好 |
+| `Using where` | Server 层做了额外过滤 | 🟡 一般，说明索引不够精准 |
+| `Using index for group-by` | 索引直接完成 GROUP BY，无需额外排序 | 🟢 优秀 |
+| `Using filesort` | **无法利用索引排序**，被迫在内存/磁盘中外部排序 | 🔴 **必须优化** |
+| `Using temporary` | **创建了临时表**（常见于 GROUP BY、DISTINCT、UNION） | 🔴 **严重，必须优化** |
+| `Using join buffer` | 联表查询使用了 Join Buffer（BNL 或 Hash Join） | 🟡 视情况而定 |
+
+---
+
+## 索引失效的七大致命场景
+
+即使建立了索引，如果 SQL 踩了以下陷阱，B+Tree 也会被 MySQL 放弃，退化为全表扫描。
+
+### 失效速查表
+
+| 序号 | 失效场景 | 错误示例 | 底层原因 |
+|------|----------|----------|----------|
+| ① | **对索引列做函数运算** | `WHERE LEFT(name, 3) = 'Tom'` 或 `WHERE DATE(create_time) = '2026-01-01'` | B+Tree 存的是原始值，套函数后无法在树上定位 |
+| ② | **隐式类型转换** | `WHERE phone = 17799990010`（phone 是 VARCHAR） | MySQL 会自动将字符串转为数字，等同于对索引列做函数 |
+| ③ | **LIKE 前导模糊** | `WHERE name LIKE '%张'` | B+Tree 按从左到右排序，前缀未知时树上无法定位 |
+| ④ | **OR 连接无索引列** | `WHERE phone = '138...' OR age = 18`（age 无索引） | OR 一侧无索引 → 全量回表比全表扫描更慢 → 优化器放弃 |
+| ⑤ | **负向条件（!= / <> / NOT IN）** | `WHERE status != 1` | 不等于条件的匹配行分散在整棵树各处，无法精确定位范围 |
+| ⑥ | **IS NULL / IS NOT NULL** | `WHERE name IS NULL` | NULL 值在 B+Tree 中排在索引最前端，范围无法确定 |
+| ⑦ | **数据分布导致优化器主动放弃** | 查询结果占全表 30% 以上 | 优化器认为全表扫描比"回表查 30% 数据"更快，主动放弃索引 |
+
+### 场景①详细拆解：索引列上做运算
+
+```sql
+-- ❌ 索引失效：对索引列使用函数
+SELECT * FROM orders WHERE DATE(create_time) = '2026-01-01';
+
+-- ✅ 等价改写：让索引列以原始形态参与比较
+SELECT * FROM orders
+WHERE create_time >= '2026-01-01 00:00:00'
+  AND create_time < '2026-01-02 00:00:00';
+```
+
+### 场景②详细拆解：隐式类型转换
+
+```sql
+-- 表结构：phone VARCHAR(11)
+-- ❌ 索引失效：字符串列与整数比较，MySQL 隐式转换为 CAST(phone AS SIGNED)
+SELECT * FROM tb_user WHERE phone = 17799990010;
+
+-- ✅ 正确写法：字符串加引号
+SELECT * FROM tb_user WHERE phone = '17799990010';
+```
+
+### 场景③详细拆解：LIKE 模糊匹配
+
+```
+WHERE name LIKE '张%'   → 可以定位到"张"开头的第一个位置，走 range 扫描  ✅
+WHERE name LIKE '%张%'  → 前后都模糊，必须遍历整棵树                         ❌
+WHERE name LIKE '%张'   → 头部模糊，无法利用 B+Tree 的有序性                ❌
+```
+
+---
+
+## JOIN 联表查询优化
+
+### MySQL 表连接算法演进
+
+| 算法 | 适用版本 | 原理 | 性能 |
+|------|----------|------|------|
+| **Simple Nested-Loop Join** | 所有版本 | 驱动表每一行遍历被驱动表全表 | 🔴 极差 O(n×m) |
+| **Block Nested-Loop Join（BNL）** | 5.5+ | 将驱动表批量缓存到 Join Buffer，减少被驱动表扫表次数 | 🟡 一般 |
+| **Index Nested-Loop Join** | 所有版本 | 被驱动表有索引，每次利用索引精确定位匹配行 | 🟢 最佳 |
+| **Hash Join** | **8.0.18+** | 将驱动表数据构建哈希表，被驱动表 O(1) 查找 | 🟢 优秀（无索引时） |
+
+### JOIN 优化核心原则
+
+```sql
+-- ❌ 两张大表无索引 JOIN → 全表笛卡尔积
+SELECT * FROM orders o, users u WHERE o.user_id = u.id;
+
+-- ✅ 小表驱动大表 + 被驱动表关联字段有索引
+-- users 100 行（小表、驱动表）→ orders 100 万行（大表、被驱动表）
+SELECT * FROM orders o
+INNER JOIN users u ON o.user_id = u.id
+WHERE u.status = 1;
+```
+
+**JOIN 优化四原则**：
+
+1. **小表驱动大表**：驱动表越小，被驱动表被扫的次数越少
+2. **被驱动表的 JOIN 字段必须有索引**：否则每次都要全表扫描
+3. **避免 `SELECT *`**：只取需要的列，减少返回数据量，为覆盖索引创造条件
+4. **MySQL 8.0.18+ 可利用 Hash Join**：两张表都没索引时，确保 `join_buffer_size` 足够大
+
+```sql
+-- 查看 join_buffer 大小
+SHOW VARIABLES LIKE 'join_buffer_size';
+-- 默认 256KB，生产环境建议 1-4MB
+SET GLOBAL join_buffer_size = 4194304;
+```
+
+---
+
+## 深分页问题与优化
+
+### 问题：传统分页翻到后面越来越慢
+
+```sql
+-- 第 1 页：飞快，扫描 10 行
+SELECT * FROM orders ORDER BY id LIMIT 0, 10;
+
+-- 第 10 万页：灾难级慢！MySQL 需先扫描前 1000010 行再丢弃前 1000000 行
+SELECT * FROM orders ORDER BY id LIMIT 1000000, 10;
+```
+
+```
+LIMIT 1000000, 10 的执行过程：
+┌──────────────────────────────────────────────────────────┐
+│  MySQL 扫描 1,000,010 行 → 丢弃前 1,000,000 行 → 返回 10 行 │
+│                                                          │
+│  99.999% 的工作量被白白浪费在"扫描并丢弃"上！                  │
+└──────────────────────────────────────────────────────────┘
+```
+
+### 解决方案：延迟关联（Deferred Join）
+
+```sql
+-- ❌ 传统分页（全表扫描后丢弃）
+SELECT * FROM orders ORDER BY id LIMIT 1000000, 10;
+
+-- ✅ 延迟关联：先在索引上定位 ID，再回表取完整数据
+SELECT o.* FROM orders o
+INNER JOIN (
+    SELECT id FROM orders ORDER BY id LIMIT 1000000, 10
+) AS tmp ON o.id = tmp.id;
+```
+
+| 方案 | 适用场景 | 原理 |
+|------|----------|------|
+| **延迟关联** | 有自增主键 | 先在覆盖索引上完成分页，只拿 10 个 ID 回表 |
+| **游标分页（推荐）** | 滚动加载/APP | `WHERE id > 上一页最后一条ID LIMIT 10`，永远不走 OFFSET |
+| **覆盖索引 + 子查询** | 联合索引覆盖了查询列 | `SELECT * FROM t WHERE id IN (SELECT id FROM t LIMIT N,10)` |
+| **ES / 搜索引擎** | 全文搜索 + 分页 | 深分页不是关系数据库的强项 |
+
+---
+
+## ORDER BY 排序优化
+
+### filesort 的产生机制
+
+当 `ORDER BY` 的列无法利用索引的有序性时，MySQL 会触发 `filesort`：
+
+```sql
+-- ✅ 利用索引排序（B+Tree 叶子已按 name 排序，直接扫描即可）
+SELECT * FROM users ORDER BY name;
+
+-- ❌ filesort（name 和 age 排序方向不一致，或排序键和查询条件不同）
+SELECT * FROM users WHERE status = 1 ORDER BY create_time DESC;
+```
+
+### filesort 的两种模式
+
+| 模式 | 配置参数 | 行为 | 性能 |
+|------|----------|------|------|
+| **单路排序（Single-pass）** | `max_length_for_sort_data` 足够大 | 一次性读出所有需要的列，在 sort_buffer 中排序后直接返回 | 🟢 较快 |
+| **双路排序（Two-pass）** | 行数据超过 `max_length_for_sort_data` | 只读排序键和 rowid，排序后再按 rowid 回表取完整行 | 🔴 更慢（多一次回表） |
+
+### ORDER BY 优化策略
+
+```sql
+-- ❌ 排序 + 大量数据 → sort_buffer 溢出到磁盘
+SELECT * FROM orders ORDER BY amount DESC;
+
+-- ✅ 策略1：让 ORDER BY 列命中索引（利用 B+Tree 天然有序性）
+SELECT * FROM orders ORDER BY id DESC;  -- 主键天然有序
+
+-- ✅ 策略2：减小排序数据量（配合 LIMIT）
+SELECT * FROM orders ORDER BY amount DESC LIMIT 100;
+
+-- ✅ 策略3：提高 sort_buffer_size
+SET SESSION sort_buffer_size = 4194304;  -- 4MB
+```
+
+---
+
+## COUNT 查询优化
+
+### COUNT(*)、COUNT(1)、COUNT(col)、COUNT(id) 的区别
+
+```
+COUNT(1)      → 1 是常量表达式。server 层遍历每一行，这一行在 server 层会判定常量非空，所以逐行计数。
+COUNT(*)      → 专门做了优化，server 层遍历每一行，直接计数——不取字段、不做值判空，最快。
+COUNT(id)     → server 层拿到具体的 id 列，检查字段 IS NOT NULL 后计入总数。比 COUNT(*) 多一次取字段操作。
+COUNT(col)    → server 层拿到 col 列，检查是否 IS NOT NULL，NULL 行不计入。若 col 无 NOT NULL 约束，
+                还要做额外判空操作，性能最差。但若 col 有 NOT NULL 约束，优化器等价为 COUNT(*)。
+```
+
+**性能排序**：`COUNT(*)` ≈ `COUNT(1)` > `COUNT(not_null_col)` > `COUNT(nullable_col)`
+
+### 大表 COUNT 优化
+
+```sql
+-- ❌ 每次查询都全表扫描
+SELECT COUNT(*) FROM orders;
+
+-- ✅ 方案1：利用 EXPLAIN 的估算值（适合不需要精确值的场景）
+EXPLAIN SELECT COUNT(*) FROM orders;  -- rows 列即为估算值
+
+-- ✅ 方案2：查询 information_schema（近似值，非精确）
+SELECT TABLE_ROWS FROM information_schema.TABLES
+WHERE TABLE_SCHEMA = 'mydb' AND TABLE_NAME = 'orders';
+
+-- ✅ 方案3：Redis 维护计数器（每次写入同步增减）
+-- INCR orders:count  -- 写入订单时 +1
+
+-- ✅ 方案4：汇总表定时刷新（适合报表场景）
+-- CREATE TABLE orders_stats AS SELECT COUNT(*) AS total FROM orders;
+```
+
+---
+
+## MySQL 优化器代价模型（Cost Model）
+
+理解优化器为什么选择（或放弃）索引，才能写出一劳永逸的高性能 SQL。
+
+### 优化器的决策逻辑
+
+```
+1. 优化器统计索引的基数（Cardinality / 区分度）
+2. 根据 WHERE 条件计算每个可能索引的 I/O 成本和 CPU 成本
+3. 选择总成本最低的执行方案
+```
+
+### 查看优化器的倾向
+
+```sql
+-- 查看最后一次查询的优化器成本估算
+SHOW STATUS LIKE 'Last_query_cost';
+-- 返回值含义：读取多少个随机数据页的成本
+
+-- 强制使用指定索引（绕过优化器，仅限调试！）
+SELECT * FROM tb_user FORCE INDEX(idx_phone) WHERE phone = '13800138000';
+
+-- 查看表的索引统计信息
+SHOW INDEX FROM tb_user;
+-- Cardinality 列：索引中不重复值的估算数量，值越接近总行数说明区分度越高
+```
+
+### 优化器误判的常见原因
+
+| 原因 | 表现 | 解决方案 |
+|------|------|----------|
+| 统计信息不准确 | 明明有索引但优化器选了全表扫描 | `ANALYZE TABLE tb_user;` 更新统计信息 |
+| 数据倾斜 | 某些热点值占了大部分行 | 对倾斜列单独建立索引 |
+| 回表代价估算偏高 | 优化器"以为"回表很贵，实际很快 | 用覆盖索引规避回表 |
+| ORDER BY 干扰 | 优化器为了免排序选了次优索引 | 建立覆盖 ORDER BY + WHERE 的联合索引 |
+
+---
+
+## INSERT / UPDATE 的索引代价
+
+建索引不能只顾查询，写入性能同样受索引制约：
+
+```sql
+-- 假设一张表有 5 个索引
+INSERT INTO tb_user VALUES (...);
+-- MySQL 实际做了：1 次数据插入 + 5 次索引维护 = 6 次磁盘写操作
+```
+
+| 维度 | 无索引表 | 索引过多表 |
+|------|----------|------------|
+| INSERT 性能 | 极高 | 每次插入需更新所有索引树 |
+| UPDATE 索引列 | — | 先删除旧索引记录 + 插入新索引记录 |
+| 磁盘占用 | 仅数据 | 数据 + N 个索引树 |
+| 查询性能 | 全表扫描 | 索引加速 |
+
+**指导原则**：查询频率低的表少建索引，写入频繁的表严格控制索引数量。
+
+---
+
+## 大厂索引设计七条铁律
+
+| 原则 | 说明 | 反面案例 |
+|------|------|----------|
+| ① 量大频高才建 | 数据量**大**（>10 万行）且查询**频次高**才建索引 | 几百行的配置表建索引纯粹浪费 |
+| ② 卡点扫描建 | `WHERE`、`ORDER BY`、`GROUP BY`、`JOIN` 字段优先建 | 只在 `SELECT` 列表中出现但不参与过滤的列不需要索引 |
+| ③ 区分度高是灵魂 | 选区分度高的列（手机号、UID），区分度 = distinct/总数 | `sex` 区分度只有 2~3，建索引毫无意义 |
+| ④ 长字段前缀索引 | VARCHAR(500) / TEXT 通过前缀索引降体积 | 全文索引 `FULLTEXT` 替代前缀索引（搜索场景） |
+| ⑤ 联合索引优先 | 多条件查询优先建联合索引而非多个单列索引 | 3 个单列索引可能只命中 1 个，另外 2 个白白浪费 |
+| ⑥ 控制索引总量 | 索引不是越多越好 | 有些表建了 10+ 个索引，写入性能直接凉透 |
+| ⑦ NOT NULL 约束 | 索引列设 `NOT NULL`，优化器决策更精准 | NULL 值在索引中占空间，且 `IS NULL` 查询易失效 |
+
+---
+
+## 实战案例：一条慢 SQL 的完整优化
+
+以下是一个真实的订单查询优化案例：
+
+```sql
+-- 原始 SQL（耗时 8.2s）
+SELECT o.id, o.order_no, o.amount, u.name, u.phone
+FROM orders o
+LEFT JOIN users u ON o.user_id = u.id
+WHERE o.create_time >= '2026-01-01'
+  AND o.status = 1
+ORDER BY o.amount DESC
+LIMIT 0, 20;
+```
+
+### 排查过程
+
+```
+1. EXPLAIN 诊断：
+   type: ALL（orders 表全表扫描） ← 致命
+   Extra: Using where; Using filesort; Using temporary
+
+2. 查看表结构：
+   orders 表 200 万行，无 create_time + status 联合索引
+   user_id 有单列索引
+
+3. 问题定位：
+   - WHERE 过滤条件 create_time + status 都无索引 → 全表扫描
+   - ORDER BY amount 无索引 → filesort
+   - JOIN 的 user_id 虽有索引，但驱动表本身太大
+```
+
+### 优化方案
+
+```sql
+-- 1. 建立联合索引（最关键的一步）
+CREATE INDEX idx_orders_time_status_amount ON orders(create_time, status, amount);
+
+-- 2. 改写 SQL（利用索引覆盖 + 延迟关联）
+SELECT o.id, o.order_no, o.amount, u.name, u.phone
+FROM orders o
+INNER JOIN (
+    SELECT id FROM orders
+    WHERE create_time >= '2026-01-01' AND status = 1
+    ORDER BY amount DESC
+    LIMIT 20
+) AS tmp ON o.id = tmp.id
+LEFT JOIN users u ON o.user_id = u.id
+ORDER BY o.amount DESC;
+```
+
+| 指标 | 优化前 | 优化后 |
+|------|--------|--------|
+| 耗时 | 8.2s | **0.03s** |
+| type | `ALL` | `range` → `eq_ref` |
+| rows | 2,000,000 | 20 |
+| Extra | `Using filesort; Using temporary` | `Using index` |
+
+---
+
+## 生产环境监控与巡检 SQL
+
+```sql
+-- 1. 查看当前正在执行的慢查询
+SHOW FULL PROCESSLIST;
+
+-- 2. 查看哪些表没有主键（InnoDB 下非常危险）
+SELECT t.table_schema, t.table_name
+FROM information_schema.TABLES t
+LEFT JOIN information_schema.STATISTICS s
+    ON t.table_schema = s.table_schema AND t.table_name = s.table_name AND s.index_name = 'PRIMARY'
+WHERE t.table_schema NOT IN ('mysql','information_schema','performance_schema','sys')
+  AND t.table_type = 'BASE TABLE'
+  AND s.index_name IS NULL;
+
+-- 3. 查看冗余索引（某个索引是另一个索引的前缀）
+SELECT * FROM sys.schema_redundant_indexes;
+
+-- 4. 查看未使用的索引（需开启 userstat）
+SELECT * FROM sys.schema_unused_indexes;
+
+-- 5. 分析表，更新索引统计信息
+ANALYZE TABLE tb_user;
+```
+
+---
+
+## 总结
+
+MySQL 性能优化的核心知识链：
+
+1. **排查链路**：慢查询日志定位 SQL → SHOW PROFILE 剖析耗时 → EXPLAIN 诊断执行计划
+2. **EXPLAIN 五要素**：`type` 定生死 / `key` 看用没用 / `key_len` 看用几列 / `rows` 看扫多少 / `Extra` 看藏雷
+3. **索引失效七场景**：函数运算、类型转换、前导模糊、OR 无索引、负向条件、IS NULL、数据倾斜
+4. **高级优化三板斧**：
+   - **深分页** → 延迟关联 / 游标分页
+   - **JOIN 慢** → 小表驱动大表 + 被驱动表索引 + MySQL 8.0 Hash Join
+   - **ORDER BY 慢** → 利用索引有序性，杜绝 filesort
+5. **记住一句话**：`type=ALL` 必须优化，`Using filesort` 高度警惕，`Using index` 是终极追求

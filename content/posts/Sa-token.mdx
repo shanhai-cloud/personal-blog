@@ -1,0 +1,460 @@
+---
+title: "轻量级安全利器：Sa-Token 核心认证与 Redis 权限隔离深度体系"
+slug: "sa-token-auth-architecture"
+date: "2026-06-19"
+tags:
+  - Sa-Token
+  - SpringBoot3
+  - Redis
+  - Authentication
+category: "Java"
+excerpt: "全面解构 Sa-Token 轻量级权限框架，详解双通道 Token 解析机制、并发登录策略控制、以及 StpInterface 权限加载内核。"
+published: true
+---
+
+Sa-Token 是一个轻量级 Java 权限认证框架。相较于 Spring Security 和 Shiro 的繁重与陡峭的学习曲线，Sa-Token 采用了**以「Token」为中心、对业务无侵入**的设计哲学。结合 Redis 存储后，它能以极低的内存开销实现高效的分布式会话和权限缓存。
+
+---
+
+## 核心架构与 Redis 数据映射
+
+Sa-Token 的底层核心逻辑非常直观：当用户登录成功后，会在 Redis 中维护两条相互映射的记录。
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                   Sa-Token Redis 双向映射                     │
+│                                                             │
+│  ┌─────────────────────────┐    ┌─────────────────────────┐ │
+│  │ Key: satoken:login:     │    │ Key: satoken:login:     │ │
+│  │      token:<Token_UUID> │    │      session:<账号ID>    │ │
+│  │                         │    │                         │ │
+│  │ Value: 1001 (账号ID)    │    │ Value: Session 对象      │ │
+│  │                         │    │  ├─ 设备列表             │ │
+│  │ 用途：通过 Token 识别    │    │  ├─ 登录时间             │ │
+│  │      当前请求是谁         │    │  ├─ Token 签名列表       │ │
+│  └─────────────────────────┘    │  └─ 自定义扩展数据        │ │
+│                                 │                         │ │
+│                                 │ 用途：维护账号的活跃状态   │ │
+│                                 │      管理设备/踢人下线     │ │
+│                                 └─────────────────────────┘ │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**请求流转**：
+
+```
+请求 Header (Authorization: xxx) → Sa-Token 拦截器解析 Token
+    → Redis 查 satoken:login:token:xxx → 得到 loginId: 1001
+    → Redis 查 satoken:login:session:1001 → 校验会话有效性
+    → 通过 → 注解鉴权 @SaCheckPermission → Controller
+```
+
+---
+
+## 依赖引入体系
+
+在基于 Spring Boot 3 的现代微服务或单体架构中，通常引入 Starter 依赖，并配合 `jackson` 序列化将持久化会话托付给 Redis：
+
+```xml
+<!-- Redis 集成（jackson 序列化） -->
+<dependency>
+    <groupId>cn.dev33</groupId>
+    <artifactId>sa-token-redis-jackson</artifactId>
+    <version>${satoken.version}</version>
+</dependency>
+
+<!-- Spring Boot 3 Starter（自带自动配置） -->
+<dependency>
+    <groupId>cn.dev33</groupId>
+    <artifactId>sa-token-spring-boot3-starter</artifactId>
+    <version>${satoken.version}</version>
+</dependency>
+```
+
+只需要引入这两个 Starter，无需任何 Java 配置代码，Sa-Token 就能自动连接 Redis 并把所有会话数据持久化过去。
+
+---
+
+## 核心配置参数深度剖析
+
+Sa-Token 的行为完全由配置文件驱动，以下是对关键参数的逐项解密：
+
+```properties
+# ===== Token 基础配置 =====
+# 前端发送请求时 Headers 中需要携带的 Key
+sa-token.token-name=Authorization
+
+# Token 风格：uuid / simple-uuid / random-32 / random-64 / tik
+sa-token.token-style=uuid
+
+# ===== 过期与活跃策略 =====
+# 绝对过期时间（秒）：默认 30 天。超过后无论是否活跃，必须重新登录
+sa-token.timeout=2592000
+
+# 滑动过期 / 最低活跃频率（秒）：-1 代表不限制
+# 若设为 3600，则用户连续 1 小时无任何请求，登录态自动冻结
+sa-token.active-timeout=-1
+
+# ===== 并发登录策略（关键组合） =====
+# 策略 A：允许同账号多端同时在线（如微信移动端 + PC 端）
+sa-token.is-concurrent=true
+sa-token.is-share=false
+
+# 策略 B：严格单端登录 / 顶号下线（企业 ERP、金融系统常用）
+# sa-token.is-concurrent=false
+
+# ===== 前后端分离安全规范 =====
+# 关闭 Cookie 读取，强制从 Header 读写 Token
+sa-token.is-read-cookie=false
+sa-token.is-write-header=true
+
+# ===== 日志 =====
+sa-token.is-log=true
+```
+
+### 并发登录策略详解
+
+| 配置组合 | `is-concurrent` | `is-share` | 效果 | 适用场景 |
+|----------|-----------------|------------|------|----------|
+| 多端在线 | `true` | `false` | 同一账号可多处登录，各有独立 Token | 微信 / 淘宝类 C 端应用 |
+| 共享会话 | `true` | `true` | 同一账号多处登录，共享同一 Token | 极少用 |
+| **顶号下线** | **`false`** | — | 新登录挤掉旧登录 Token | **企业 ERP / 金融系统** |
+
+---
+
+## 核心配置类与路由拦截机制
+
+实现 `WebMvcConfigurer` 将 Sa-Token 的路由拦截器注入到 Spring 容器中：
+
+```java
+@Configuration
+public class SaTokenConfig implements WebMvcConfigurer {
+
+    // 注册 Sa-Token 的路由拦截器，面向路径进行统一鉴权
+    @Override
+    public void addInterceptors(InterceptorRegistry registry) {
+        registry.addInterceptor(new SaInterceptor(handle -> {
+            // 拦截所有路径，但排除登录、验证码等开放接口
+            SaRouter.match("/**")
+                    .notMatch("/login", "/captchaImage", "/register")
+                    .check(r -> StpUtil.checkLogin()); // 核心卡点：校验是否登录
+        })).addPathPatterns("/**");
+    }
+}
+```
+
+### 拦截器 vs 注解 双重保障
+
+```
+请求进入
+    │
+    ├── 路由拦截器 (SaInterceptor)
+    │   → 路径级校验：是否登录？（全局兜底）
+    │   → 未登录 → 全局异常处理器捕获 NotLoginException → 返回 401
+    │
+    ├── Controller 方法注解 (@SaCheckPermission)
+    │   → 权限码校验：是否有 system:user:delete？（细粒度）
+    │   → 无权限 → 全局异常处理器捕获 NotPermissionException → 返回 403
+    │
+    └── 业务逻辑
+```
+
+---
+
+## StpInterface — 权限与角色加载机制
+
+当我们在 Controller 上使用 `@SaCheckPermission("user.add")` 或 `@SaCheckRole("admin")` 时，Sa-Token 底层会**自动回调 `StpInterface` 的实现类**去捞取真实数据：
+
+```java
+@Slf4j
+@Component
+@RequiredArgsConstructor
+public class StpInterfaceImpl implements StpInterface {
+
+    private final SysUserMapper userMapper;
+
+    /**
+     * 返回一个账号所拥有的权限码集合
+     *
+     * 调用时机：每次 @SaCheckPermission 注解触发时
+     * 性能优化：一次请求中会多次调用，务必加缓存！
+     */
+    @Override
+    public List<String> getPermissionList(Object loginId, String loginType) {
+        // loginId 在 Redis 中存的是字符串，需要安全转换
+        Long userId = Long.valueOf(loginId.toString());
+
+        // 核心优化：优先从 Redis/本地缓存拿，拿不到再查库
+        // Sa-Token 在一次请求中可能多次回调此方法，
+        // 不加缓存会导致每次注解校验都查一次数据库！
+        List<String> permissions = getCachedPermissions(userId);
+        if (permissions != null) {
+            return permissions;
+        }
+
+        log.info("缓存未命中，从数据库加载用户 [{}] 的权限列表", userId);
+        permissions = userMapper.selectPermissionsByUserId(userId);
+        cachePermissions(userId, permissions);
+        return permissions;
+    }
+
+    /**
+     * 返回一个账号所拥有的角色标识集合 (如: [admin, dev, user])
+     */
+    @Override
+    public List<String> getRoleList(Object loginId, String loginType) {
+        Long userId = Long.valueOf(loginId.toString());
+        List<String> roles = getCachedRoles(userId);
+        if (roles != null) {
+            return roles;
+        }
+        roles = userMapper.selectRolesByUserId(userId);
+        cacheRoles(userId, roles);
+        return roles;
+    }
+}
+```
+
+### StpInterface 调用链路
+
+```
+Controller 方法上有 @SaCheckPermission("user.add")
+    │
+    ↓
+Sa-Token 拦截到注解
+    │
+    ↓
+回调 StpInterfaceImpl.getPermissionList(loginId, loginType)
+    │
+    ├── 优先查缓存（避免一次请求多次查库）
+    │
+    ├── 缓存未命中 → 查数据库
+    │
+    └── 返回权限列表: ["system:user:list", "system:user:add", ...]
+            │
+            ↓
+Sa-Token 判断 "user.add" 是否在列表中
+    ├── 在 → 放行
+    └── 不在 → 抛 NotPermissionException → 全局异常处理 → 返回 403
+```
+
+---
+
+## 核心业务闭环：登录与鉴权
+
+有了上述依赖和配置后，Service 层的调用变得极其优雅和精简：
+
+### 登录流转
+
+```java
+@Service
+public class LoginService {
+
+    public AjaxResult login(String username, String password) {
+        // 1. 传统账密校验
+        SysUser user = userMapper.selectByUsername(username);
+        if (user == null || !passwordEncoder.matches(password, user.getPassword())) {
+            throw new BadCredentialsException("用户名或密码错误");
+        }
+
+        // 2. 一行代码完成登录 —— Sa-Token 自动帮你做：
+        //    a. 生成符合 token-style 风格的 Token 字符串
+        //    b. 将 loginId → Token 的映射写入 Redis
+        //    c. 创建 Session 对象写入 Redis
+        //    d. 将 Token 自动注入到 HttpServletResponse 响应头
+        StpUtil.login(user.getId());
+
+        // 3. 返回 Token 信息给前端
+        SaTokenInfo tokenInfo = StpUtil.getTokenInfo();
+        return AjaxResult.success()
+            .put("token", tokenInfo.getTokenValue())
+            .put("tokenName", tokenInfo.getTokenName());
+    }
+}
+```
+
+### 鉴权流转
+
+```java
+@RestController
+@RequestMapping("/system/user")
+public class UserController {
+
+    // 方式 A：代码主动强校验
+    // 不通过直接抛出 NotLoginException / NotPermissionException
+    @GetMapping("/profile")
+    public AjaxResult profile() {
+        StpUtil.checkLogin();                         // 校验登录
+        long userId = StpUtil.getLoginIdAsLong();     // 获取当前登录用户 ID
+        return AjaxResult.success(userService.getById(userId));
+    }
+
+    // 方式 B：优雅的注解形式（推荐）
+    @PostMapping("/add")
+    @SaCheckPermission("system:user:add")
+    public AjaxResult add(@RequestBody User user) {
+        return AjaxResult.success(userService.save(user));
+    }
+
+    @DeleteMapping("/{ids}")
+    @SaCheckPermission("system:user:remove")
+    @SaCheckRole("admin")  // 同时校验角色
+    public AjaxResult remove(@PathVariable Long[] ids) {
+        userService.removeByIds(ids);
+        return AjaxResult.success();
+    }
+}
+```
+
+### 常用 StpUtil 方法速查
+
+| 方法 | 作用 |
+|------|------|
+| `StpUtil.login(id)` | 登录，生成 Token 并写入 Redis |
+| `StpUtil.logout()` | 登出，清除 Redis 中的 Token 和 Session |
+| `StpUtil.isLogin()` | 判断当前请求是否已登录 |
+| `StpUtil.checkLogin()` | 校验登录，未登录抛异常 |
+| `StpUtil.getLoginId()` | 获取当前登录用户 ID（Object） |
+| `StpUtil.getLoginIdAsLong()` | 获取当前登录用户 ID（Long） |
+| `StpUtil.getTokenInfo()` | 获取当前 Token 的详细信息 |
+| `StpUtil.checkPermission("xxx")` | 校验权限码 |
+| `StpUtil.checkRole("admin")` | 校验角色 |
+| `StpUtil.kickout(loginId)` | 踢指定用户下线 |
+| `StpUtil.disable(loginId, time)` | 封禁指定用户指定时长 |
+
+---
+
+## 全局异常处理
+
+Sa-Token 的异常不会自动返回规范的 JSON，需要配置全局异常处理器：
+
+```java
+@RestControllerAdvice
+public class GlobalExceptionHandler {
+
+    // 未登录异常
+    @ExceptionHandler(NotLoginException.class)
+    public AjaxResult handleNotLogin(NotLoginException e) {
+        return AjaxResult.error(401, "请先登录");
+    }
+
+    // 无权限异常
+    @ExceptionHandler(NotPermissionException.class)
+    public AjaxResult handleNotPermission(NotPermissionException e) {
+        return AjaxResult.error(403, "没有该操作权限");
+    }
+
+    // 无角色异常
+    @ExceptionHandler(NotRoleException.class)
+    public AjaxResult handleNotRole(NotRoleException e) {
+        return AjaxResult.error(403, "没有该角色权限");
+    }
+
+    // 被踢下线异常
+    @ExceptionHandler(NotLoginException.class)
+    public AjaxResult handleKickout(NotLoginException e) {
+        if (e.getType().equals(NotLoginException.KICK_OUT)) {
+            return AjaxResult.error(401, "您的账号在其他设备登录，已被强制下线");
+        }
+        return AjaxResult.error(401, "请先登录");
+    }
+}
+```
+
+---
+
+## 多账户体系隔离
+
+如果你的系统既有「后台管理员」又有「移动端普通用户」，它们查不同的表、拥有不同的鉴权逻辑。Sa-Token 提供了多账号体系隔离：
+
+```java
+// ===== 管理员登录（默认 loginType = "login"） =====
+StpUtil.login(adminId);        // 查 admin_user 表
+StpUtil.checkPermission("system:user:delete");
+
+// ===== 移动端用户登录（自定义 loginType = "user"） =====
+StpUserUtil.login(userId);     // 查 app_user 表
+StpUserUtil.checkPermission("order:create");
+```
+
+在 `StpInterface` 中通过 `loginType` 参数区分：
+
+```java
+@Override
+public List<String> getPermissionList(Object loginId, String loginType) {
+    if ("login".equals(loginType)) {
+        // 后台管理员 → 查 admin 权限表
+        return adminPermMapper.selectByUserId(Long.valueOf(loginId.toString()));
+    } else if ("user".equals(loginType)) {
+        // 移动端用户 → 查 app 权限表
+        return appPermMapper.selectByUserId(Long.valueOf(loginId.toString()));
+    }
+    return Collections.emptyList();
+}
+```
+
+---
+
+## 核心避坑要点
+
+### 1. loginId 的数据类型陷阱
+
+执行 `StpUtil.login(Object loginId)` 时，传入的 `Long` 类型（如 `1001L`）存入 Redis 后会变成字符串 `"1001"`。后续在 `StpInterfaceImpl` 中获取时，**必须**使用 `Long.valueOf(loginId.toString())` 安全转换，直接 `(Long) loginId` 强转会抛 `ClassCastException`。
+
+```java
+// ✅ 正确：安全转换
+Long userId = Long.valueOf(loginId.toString());
+
+// ❌ 错误：ClassCastException
+Long userId = (Long) loginId;
+```
+
+### 2. StpInterface 的调用频率
+
+一次请求如果 Controller 上有 3 个 `@SaCheckPermission` 注解，`getPermissionList()` 会被调用 3 次。**必须加缓存**，否则一次请求查 3 次数据库：
+
+```java
+// 简单的一级缓存实现（请求级别）
+private List<String> cachedPermissions;
+
+@Override
+public List<String> getPermissionList(Object loginId, String loginType) {
+    if (cachedPermissions != null) {
+        return cachedPermissions; // 同一次请求中第二次调用直接返回
+    }
+    cachedPermissions = userMapper.selectPermissionsByUserId(
+        Long.valueOf(loginId.toString()));
+    return cachedPermissions;
+}
+```
+
+### 3. is-concurrent 与 is-share 的排列组合
+
+这两个参数的互动坑过很多新手。`is-concurrent=false` 时，`is-share` 参数被忽略，登录策略恒为顶号下线。
+
+---
+
+## Sa-Token vs Spring Security 对比
+
+| 维度 | Sa-Token | Spring Security |
+|------|----------|-----------------|
+| 学习曲线 | 低，API 直观 | 高，概念多（过滤器链、Provider、Manager） |
+| 配置方式 | 注解 + 配置文件 | Java Config + 大量 Builder 链 |
+| 登录代码量 | `StpUtil.login(id)` 一行 | 需要手动写多个过滤器 + Provider |
+| 权限注解 | `@SaCheckPermission("xxx")` | `@PreAuthorize("@ss.hasPermi('xxx')")` |
+| Redis 集成 | 引入 starter 自动集成 | 需手动实现 TokenStore |
+| 踢人下线 | `StpUtil.kickout(id)` 一行 | 需要手动维护 Redis 黑名单 |
+| 多账户体系 | `StpUtil` vs `StpUserUtil` 天然隔离 | 需手动配置多套 SecurityFilterChain |
+| 适用场景 | 中小项目、快速开发 | 大型企业、需要细粒度定制的场景 |
+
+---
+
+## 总结
+
+Sa-Token 的核心设计哲学就三点：
+
+1. **以 Token 为中心**：不关心你是谁（UserDetails），只关心你的 Token 有没有效、有什么权限
+2. **Redis 双向映射**：`token → loginId` + `loginId → Session`，两条 Key 撑起全部会话管理
+3. **注解驱动鉴权**：`@SaCheckPermission` + `StpInterface` 回调，业务代码零侵入
+
+记住：**配置决定行为，StpInterface 提供数据，注解控制权限，全局异常统一返回** — 四层闭环构成完整的安全体系。

@@ -1,0 +1,398 @@
+---
+title: "Spring Security 核心机制：深入浅出 Authentication 认证架构流转"
+slug: "springsecurity-auth-architecture"
+date: "2026-06-19"
+tags:
+  - SpringSecurity
+  - Java
+  - Architecture
+  - SourceCode
+category: "Java"
+excerpt: "解构 Spring Security 核心认证体系，详解 Authentication 状态演变、AuthenticationManager 委派模型及 DaoAuthenticationProvider 校验内核。"
+published: true
+---
+
+Spring Security 的核心功能主要围绕**认证（Authentication，你是谁）**和**授权（Authorization，你能做什么）**展开。其中，认证体系采用了高度可扩展的**委派模型（Delegation Model）**。理解这一体系的关键，在于把握认证对象在不同组件之间的状态演变。
+
+---
+
+## 认证核心架构与组件时序
+
+Spring Security 的认证不是由一个类孤立完成的，而是一条清晰的组件委托链：
+
+```
+┌──────────────────────────────────────────────────────────┐
+│              Spring Security 认证组件链                    │
+│                                                          │
+│  Filter ──→ AuthenticationManager ──→ AuthenticationProvider
+│  拦截请求     (ProviderManager)        (策略实现)           │
+│    │              │                       │               │
+│    │ 封装未认证     │ 遍历查找匹配的           │ 调用           │
+│    │ Token         │ Provider               ↓               │
+│    ↓              │              UserDetailsService         │
+│                   │              (loadUserByUsername)        │
+│                   │                    │                    │
+│                   │              PasswordEncoder             │
+│                   │              (密码比对)                   │
+│                   │                    │                    │
+│                   ↓                    ↓                    │
+│              返回已认证 Authentication 对象                    │
+│                   │                                        │
+│                   ↓                                        │
+│         SecurityContextHolder.setAuthentication()           │
+│         (注入当前线程上下文)                                   │
+└──────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 核心对象：Authentication 的状态演变
+
+`Authentication` 接口是整个认证上下文的核心载体。在账密登录模式下，其实现类通常为 `UsernamePasswordAuthenticationToken`。它在认证前后存在着严格的**状态反转**。
+
+### 认证前后对象状态对比
+
+| 属性方法 | 认证前（Unauthenticated） | 认证后（Authenticated） |
+|----------|--------------------------|------------------------|
+| **Principal (主体)** | 前端传来的字符串：`"zhangsan"` | 从数据库查出的 `UserDetails` 完整对象 |
+| **Credentials (凭证)** | 前端传来的明文密码：`"123456"` | **`null`** — 认证成功后必须擦除，防止内存泄露 |
+| **Authorities (权限)** | `null` 或空集合 | `List<GrantedAuthority>` 真实角色和权限 |
+| **isAuthenticated()** | **`false`** | **`true`** |
+
+### 源码级伪代码演变
+
+```java
+// ===== 认证前：仅包含账号密码的粗糙对象 =====
+Authentication before = new UsernamePasswordAuthenticationToken(
+    "zhangsan",   // principal: 仅仅是字符串
+    "123456"      // credentials: 明文密码
+);
+System.out.println(before.isAuthenticated()); // false
+System.out.println(before.getAuthorities());  // null
+
+// ===== 认证后：填充了完整主体与权限的饱满对象 =====
+Authentication after = new UsernamePasswordAuthenticationToken(
+    userDetails,   // principal: 完整的 UserDetails 实体
+    null,          // credentials: 已擦除
+    authorities    // [ROLE_ADMIN, system:user:delete]
+);
+System.out.println(after.isAuthenticated()); // true
+System.out.println(after.getAuthorities());  // [ROLE_ADMIN, system:user:delete]
+```
+
+### 为什么要擦除 Credentials？
+
+```
+认证前：principal="zhangsan", credentials="123456"  ← 密码还在内存中
+                                                      ↓ authenticate() 执行完毕
+认证后：principal=UserDetails, credentials=null       ← 密码已擦除
+
+如果密码不擦除：
+- 后续代码（日志、序列化、拦截器）可能意外泄露明文密码
+- 存放在 SecurityContextHolder 中被同一线程内的其他代码拿到
+- 安全审计直接挂掉
+```
+
+---
+
+## 深度解密：AuthenticationManager 委派机制
+
+当调用 `authenticationManager.authenticate(token)` 时，底层的核心流转逻辑如下。
+
+### 全局管理者与认证提供者
+
+| 组件 | 角色 | 常见实现 |
+|------|------|----------|
+| **AuthenticationManager** | 总负责人，接收 Token，调度 Provider | `ProviderManager` |
+| **AuthenticationProvider** | 具体策略执行者，负责某一种认证方式 | `DaoAuthenticationProvider` |
+
+设计哲学：**一个 Manager 下挂多个 Provider**。不同认证方式（账密登录、短信验证码登录、指纹登录、OAuth2）对应不同的 Provider，Manager 遍历找到能处理的 Provider 并委派给它。
+
+### 遍历与匹配机制（源码内核）
+
+```java
+// ProviderManager.authenticate() 核心逻辑（简化）
+public Authentication authenticate(Authentication authentication) {
+
+    // 拿到当前传入 Token 的 Class 类型（如 UsernamePasswordAuthenticationToken.class）
+    Class<? extends Authentication> toTest = authentication.getClass();
+
+    Authentication result = null;
+
+    // 遍历所有注册的认证提供者
+    for (AuthenticationProvider provider : this.getProviders()) {
+
+        // 🔑 关键卡点：当前 Provider 是否支持处理这种类型的 Token？
+        if (!provider.supports(toTest)) {
+            continue; // 不支持，跳过，尝试下一个
+        }
+
+        try {
+            // 委派给匹配的 Provider 进行核心校验
+            result = provider.authenticate(authentication);
+            if (result != null) {
+                // 认证成功，跳出循环
+                copyDetails(authentication, result);
+                break;
+            }
+        } catch (AuthenticationException e) {
+            // 当前 Provider 认证失败
+            // 如果最后一个 Provider 也失败了，抛出异常
+            lastException = e;
+        }
+    }
+
+    if (result == null && lastException != null) {
+        throw lastException;
+    }
+    return result;
+}
+```
+
+### 多 Provider 注册示例
+
+```java
+@Configuration
+public class SecurityConfig {
+
+    @Bean
+    public AuthenticationManager authenticationManager() {
+        ProviderManager manager = new ProviderManager(
+            daoAuthenticationProvider(),     // 账密登录
+            smsCodeAuthenticationProvider(), // 短信验证码登录
+            wechatAuthenticationProvider()   // 微信扫码登录
+        );
+        return manager;
+    }
+
+    @Bean
+    public DaoAuthenticationProvider daoAuthenticationProvider() {
+        DaoAuthenticationProvider provider = new DaoAuthenticationProvider();
+        provider.setUserDetailsService(myUserDetailsService);
+        provider.setPasswordEncoder(passwordEncoder());
+        return provider;
+    }
+}
+```
+
+---
+
+## 落地内核：DaoAuthenticationProvider 校验全流程
+
+在账密体系中，挑拣出的具体执行者通常是 `DaoAuthenticationProvider`（数据访问认证提供者）。它的 `authenticate` 方法中隐藏了三步核心闭环：
+
+```java
+// DaoAuthenticationProvider.authenticate() 核心逻辑（简化）
+@Override
+public Authentication authenticate(Authentication authentication) {
+
+    // 拿到前端传入的 username
+    String username = authentication.getName();
+    String presentPassword = (String) authentication.getCredentials();
+
+    // ===== 第一步：加载用户 =====
+    UserDetails user = this.getUserDetailsService().loadUserByUsername(username);
+    // ↑ 若查无此人 → 抛出 UsernameNotFoundException
+    // 返回的 UserDetails 中包含数据库加密后的密码（哈希值）
+
+    // ===== 第二步：前置校验 =====
+    // 检查账号是否锁定、是否过期、是否禁用等
+    preAuthenticationChecks.check(user);  // isAccountNonLocked / isEnabled / isAccountNonExpired
+
+    // ===== 第三步：密码比对 =====
+    String encryptedPassword = user.getPassword();
+    if (!this.getPasswordEncoder().matches(presentPassword, encryptedPassword)) {
+        // BCryptPasswordEncoder 内部会提取盐值并重新计算哈希
+        throw new BadCredentialsException("用户名或密码错误");
+    }
+
+    // ===== 第四步：后置校验 =====
+    // 检查密码是否过期（可选的扩展点）
+    postAuthenticationChecks.check(user);  // isCredentialsNonExpired
+
+    // ===== 第五步：返回已认证的 Token =====
+    return createSuccessAuthentication(principal, authentication, user);
+    // ↑ 内部 new 一个已认证状态的 UsernamePasswordAuthenticationToken
+    //    principal = UserDetails, credentials = null, authorities = user.getAuthorities()
+}
+```
+
+### UserDetailsService — 职责极其单一
+
+```java
+@Service
+public class MyUserDetailsService implements UserDetailsService {
+
+    @Autowired
+    private SysUserMapper userMapper;
+
+    @Override
+    public UserDetails loadUserByUsername(String username) {
+        // 职责：只去数据库把用户捞出来
+        // 不要在此处做密码比对！不要做封禁判断！
+        SysUser user = userMapper.selectByUsername(username);
+        if (user == null) {
+            throw new UsernameNotFoundException("用户不存在");
+        }
+        return new SecurityUser(user); // SecurityUser implements UserDetails
+    }
+}
+```
+
+**UserDetails 关键方法**：
+
+| 方法 | 返回值含义 | 由谁校验 |
+|------|-----------|----------|
+| `getPassword()` | 加密后的密码 | `PasswordEncoder.matches()` |
+| `getAuthorities()` | 角色和权限列表 | `AbstractSecurityInterceptor` |
+| `isAccountNonLocked()` | 账号未锁定 | `DaoAuthenticationProvider` |
+| `isEnabled()` | 账号已启用 | `DaoAuthenticationProvider` |
+| `isAccountNonExpired()` | 账号未过期 | `DaoAuthenticationProvider` |
+| `isCredentialsNonExpired()` | 密码未过期 | `DaoAuthenticationProvider` |
+
+---
+
+## 认证成功的后续闭环：SecurityContextHolder
+
+通过 `AuthenticationManager` 拿到已认证的 Authentication 对象后，**认证并未完全结束**，还必须完成最后的上下文绑定：
+
+```java
+// 1. 核心认证
+Authentication authentication = authenticationManager.authenticate(authenticationToken);
+
+// 2. 【必须的闭环】注入当前线程上下文
+// 只有这一步之后，后续的 Controller / Service 才能通过 SecurityContextHolder 获取用户信息
+SecurityContextHolder.getContext().setAuthentication(authentication);
+
+// 3. 此时线程内任何地方都可以获取当前用户了
+Authentication currentUser = SecurityContextHolder.getContext().getAuthentication();
+String username = currentUser.getName();
+boolean hasRoleAdmin = currentUser.getAuthorities().stream()
+    .anyMatch(a -> a.getAuthority().equals("ROLE_ADMIN"));
+```
+
+### SecurityContext 存储策略
+
+| 策略 | 说明 | 适用场景 |
+|------|------|----------|
+| `MODE_THREADLOCAL`（默认） | 绑定当前线程，请求结束自动清理 | 同步请求 |
+| `MODE_INHERITABLETHREADLOCAL` | 子线程可继承父线程的上下文 | `@Async` 异步方法 |
+| `MODE_GLOBAL` | 全局单例，所有线程共享 | 基本不用 |
+
+```java
+// 配置 InheritableThreadLocal 模式，让 @Async 子线程也能拿到当前用户
+@Bean
+public SecurityContextHolderStrategy securityContextHolderStrategy() {
+    SecurityContextHolder.setStrategyName(
+        SecurityContextHolder.MODE_INHERITABLETHREADLOCAL);
+    return SecurityContextHolder.getContextHolderStrategy();
+}
+```
+
+---
+
+## 密码加密器：BCryptPasswordEncoder
+
+Spring Security 推荐使用 `BCryptPasswordEncoder`，它是目前业界标准的选择：
+
+```java
+@Bean
+public PasswordEncoder passwordEncoder() {
+    // strength 越大加密越慢（默认 10，范围 4-31）
+    return new BCryptPasswordEncoder();
+}
+
+// 使用示例
+String rawPassword = "123456";
+String encodedPassword = passwordEncoder.encode(rawPassword);
+// 输出: $2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy
+
+// 存储的只有哈希，不存盐值——盐值就藏在 $2a$10$... 的格式里
+// BCryptPasswordEncoder.matches() 会自动从密文中提取盐值重新计算
+boolean match = passwordEncoder.matches("123456", encodedPassword); // true
+```
+
+---
+
+## 核心避坑要点
+
+### 1. 职责分离原则
+
+```
+UserDetailsService  ──→  只负责捞数据（查 DB / LDAP / Redis）
+                          不要做密码比对
+                          不要做封禁判断
+
+AuthenticationProvider ──→ 密码匹配、账号状态校验、返回最终 Token
+                          统一在此处完成所有校验逻辑
+```
+
+### 2. 密码擦除机制
+
+Spring Security 默认 `eraseCredentialsAfterAuthentication = true`。一旦 `authenticate()` 执行完毕，Token 中的明文密码即被抹除。如果你在事件监听器中还需要明文密码：
+
+```java
+// ❌ 这样拿不到 — 密码已被擦除
+@Component
+public class LoginSuccessListener implements ApplicationListener<AuthenticationSuccessEvent> {
+    @Override
+    public void onApplicationEvent(AuthenticationSuccessEvent event) {
+        Authentication auth = event.getAuthentication();
+        String pwd = (String) auth.getCredentials(); // null!
+    }
+}
+```
+
+```java
+// ✅ 两种方案：
+// 方案 1：关闭密码自动擦除
+// securityConfig http.xxx().and()
+//     .authenticationProvider(provider).eraseCredentials(false);
+
+// 方案 2：在认证前自行缓存密码（推荐）
+// 在自定义 AuthenticationProvider 的 authenticate() 中，
+// 密码校验通过后、返回新 Token 之前，自行保存到其他上下文
+```
+
+### 3. Provider 遍历顺序就是优先级
+
+Provider 列表是有序的，**第一个 `supports()` 返回 true 的 Provider 就会处理请求**。如果有多个能处理的 Provider，后面的永远不会被调用。善用这个特性设置优先级：
+
+```java
+List<AuthenticationProvider> providers = new ArrayList<>();
+providers.add(tokenAuthProvider);   // 优先级最高：从 Header 直接恢复 Token
+providers.add(daoAuthProvider);     // 其次：账密登录
+providers.add(smsAuthProvider);     // 最后：短信验证码登录
+```
+
+### 4. BCrypt 性能陷阱
+
+`BCryptPasswordEncoder` 的 `strength` 参数（log rounds）影响哈希计算时间。`strength=10` 约需 0.1s，`strength=14` 约需 1.6s。在注册/登录的并发场景下，过高会拖垮 CPU：
+
+| strength | 计算时间 | 建议 |
+|----------|----------|------|
+| 8 | ~7ms | 最低可用 |
+| **10** | **~100ms** | **生产推荐** |
+| 12 | ~400ms | 高安全场景 |
+| 14 | ~1.6s | 不推荐，太慢 |
+
+---
+
+## 总结
+
+Spring Security 认证体系的理解框架：
+
+1. **一个接口贯穿始终**：`Authentication` 在认证前和认证后是两个完全不同状态的对象，Principal 从 String 变 UserDetails，Credentials 从明文字符串变 null
+
+2. **两层委派设计**：
+   - `AuthenticationManager` → 遍历 `AuthenticationProvider` 列表找到匹配者
+   - `AuthenticationProvider` → 调用 `UserDetailsService` 捞数据 + `PasswordEncoder` 验密码
+
+3. **三个核心接口需要自己实现**：
+   - `UserDetailsService.loadUserByUsername()` — 查用户
+   - `UserDetails`（实体类）— 封装用户信息 + 状态
+   - `PasswordEncoder`（直接用 `BCryptPasswordEncoder` 即可）
+
+4. **一个必须做的收尾**：认证成功后必须 `SecurityContextHolder.getContext().setAuthentication(authentication)`，否则任何地方都拿不到当前登录用户
+
+**记住一句话：ProviderManager 是调度员，DaoAuthenticationProvider 是执行者，UserDetailsService 只负责查库，密码擦除是安全底线。**
