@@ -1,0 +1,954 @@
+---
+title: "Redis 进阶实战：缓存三大问题、Redisson 分布式协调与秒杀全链路深度解析"
+slug: "redis-advanced-practice"
+date: "2026-06-19"
+tags:
+  - Redis
+  - Distributed-Lock
+  - Redisson
+  - Seckill
+  - Concurrency
+category: "数据库"
+excerpt: "深入解析 Redis 缓存穿透/击穿/雪崩三大问题的生产级解决方案，拆解 Redisson 分布式锁 Watchdog 内核，全程手写秒杀 Lua 脚本与异步架构。"
+published: true
+---
+
+Redis 远不止一个简单的 key-value 缓存。在企业级高并发架构中，它是缓存层、分布式锁协调器、限流哨兵、消息中转站的多面手。本文将沿着**缓存治理 → 分布式协调 → 高并发实战**的主线，逐层深入 Redis 进阶体系。
+
+---
+
+## Redis 核心数据结构速览
+
+在深入缓存问题之前，先快速建立 Redis 数据模型的全景认知：
+
+| 数据结构 | 底层实现 | 核心操作 | 典型场景 |
+|----------|----------|----------|----------|
+| **String** | SDS（简单动态字符串）/ int | `SET` `GET` `INCR` `SETNX` | 缓存对象、计数器、分布式锁 |
+| **Hash** | 压缩列表 / 哈希表 | `HSET` `HGET` `HINCRBY` | 对象存储（用户信息）、购物车 |
+| **List** | 快速列表（QuickList） | `LPUSH` `BRPOP` `LRANGE` | 消息队列、最新消息 Timeline |
+| **Set** | 整数集合 / 哈希表 | `SADD` `SINTER` `SISMEMBER` | 标签、共同好友、去重 |
+| **ZSet** | 压缩列表 / 跳跃表 | `ZADD` `ZRANGE` `ZREVRANK` | 排行榜、延迟队列、优先级队列 |
+| **Stream** | Rax 树 | `XADD` `XREAD` `XGROUP` | 持久化消息队列、消费者组 |
+| **Bitmap** | String 的位操作 | `SETBIT` `BITCOUNT` `BITOP` | 签到打卡、日活统计 |
+| **HyperLogLog** | 基数估计算法 | `PFADD` `PFCOUNT` `PFMERGE` | UV 统计、去重计数（误差 0.81%） |
+| **Geo** | ZSet 封装 | `GEOADD` `GEORADIUS` `GEODIST` | 附近的人、门店搜索 |
+
+---
+
+## 一、Redis 缓存三大问题及生产级解决方案
+
+在高并发架构中，缓存的引入带来了三大致命问题：**缓存穿透**、**缓存击穿**和**缓存雪崩**。
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                    缓存三大问题全景图                                │
+│                                                                  │
+│    缓存穿透                    缓存击穿                    缓存雪崩   │
+│                                                                  │
+│  请求不存在的数据            热点Key过期瞬间             大量Key同时过期 │
+│  (缓存无→DB也无)            (缓存无→DB有)             (缓存层整体崩溃) │
+│        │                        │                         │       │
+│        ▼                        ▼                         ▼       │
+│   每次直接打DB              并发全部打DB             所有请求打DB     │
+│        │                        │                         │       │
+│        ▼                        ▼                         ▼       │
+│  布隆过滤器+空对象缓存       互斥锁+逻辑过期          随机TTL+多级缓存 │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 1.1 缓存穿透（Cache Penetration）
+
+**核心概念**：用户查询的数据**在缓存中不存在，在数据库中也不存在**。由于两层都未命中，每次请求都直接打到数据库上。通常由非法参数、恶意攻击或爬虫引起。
+
+```
+正常请求：Client → Redis(有) → 返回
+穿透攻击：Client → Redis(无) → DB(也无) → 每一次都查到底！
+                                             ↑ 恶意循环
+```
+
+#### 方案一：缓存空对象
+
+```java
+public Product getProductWithPassThrough(Long id) {
+    String cacheKey = "cache:product:" + id;
+
+    // 1. 从缓存中获取数据
+    String json = stringRedisTemplate.opsForValue().get(cacheKey);
+
+    // 2. 判断是否命中
+    if (Boolean.TRUE.equals(stringRedisTemplate.hasKey(cacheKey))) {
+        if (json == null || "EMPTY_OBJECT".equals(json)) {
+            return null; // 命中空缓存标记，直接返回
+        }
+        return JSON.parseObject(json, Product.class);
+    }
+
+    // 3. 缓存未命中，查询数据库
+    Product product = productMapper.selectById(id);
+    if (product == null) {
+        // 4. 数据库也没有 → 缓存空对象，设置短 TTL 防止穿透
+        stringRedisTemplate.opsForValue()
+            .set(cacheKey, "EMPTY_OBJECT", 2, TimeUnit.MINUTES);
+        return null;
+    }
+
+    // 5. 写入正常缓存
+    stringRedisTemplate.opsForValue()
+        .set(cacheKey, JSON.toJSONString(product), 30, TimeUnit.MINUTES);
+    return product;
+}
+```
+
+#### 方案二：布隆过滤器（Bloom Filter）
+
+布隆过滤器通过多个 Hash 函数将所有合法 Key 映射到 Bitmap 中。请求先过过滤器，不存在则直接拦截：
+
+```java
+@Component
+public class BloomFilterService {
+
+    private final RedissonClient redisson;
+    private RBloomFilter<String> productBloomFilter;
+
+    public BloomFilterService(RedissonClient redisson) {
+        this.redisson = redisson;
+    }
+
+    @PostConstruct
+    public void init() {
+        // 初始化布隆过滤器：预计 100 万元素，误判率 1%
+        productBloomFilter = redisson.getBloomFilter("product:bloom");
+        productBloomFilter.tryInit(1_000_000L, 0.01);
+
+        // 启动时加载全部合法 Key
+        List<Long> allIds = productMapper.selectAllIds();
+        for (Long id : allIds) {
+            productBloomFilter.add("product:" + id);
+        }
+    }
+
+    public Product getProduct(Long id) {
+        String key = "product:" + id;
+
+        // 布隆过滤器预判：不存在则直接拦截
+        if (!productBloomFilter.contains(key)) {
+            return null; // 绝对不存在，拒绝请求
+        }
+
+        // 可能存在（有 1% 误判率）→ 继续查缓存 + DB
+        // ... 正常的缓存→数据库查询逻辑
+        return queryWithCache(id);
+    }
+}
+```
+
+**两种方案对比**：
+
+| 维度 | 缓存空对象 | 布隆过滤器 |
+|------|-----------|-----------|
+| 内存占用 | 随攻击 Key 数量线性增长 | 固定大小，极省内存 |
+| 实现复杂度 | 极简单 | 需预加载合法 Key，需处理新增 Key |
+| 误判 | 无 | 存在（可调参降至 <1%） |
+| Key 删除支持 | 天然支持 TTL 过期 | 原生不支持删除（需 Counting Bloom Filter） |
+| 适用场景 | 穿透 Key 数量少、变化频繁 | 穿透 Key 数量大、合法 Key 集合稳定 |
+
+---
+
+### 1.2 缓存击穿（Cache Breakdown）
+
+**核心概念**：一个高并发访问的热点 Key（如爆款商品），在过期的瞬间，大量请求同时发现缓存失效，涌向数据库重建缓存，造成数据库瞬时压力飙升。
+
+```
+时间线：
+  热点Key过期 ─┬─ 请求1 → 缓存无 → 查DB（慢）────────────────→ 重建缓存
+              ├─ 请求2 → 缓存无 → 查DB（慢）→ 查DB（慢）────→ 重建缓存
+              ├─ 请求3 → 缓存无 → 查DB（慢）→ 查DB（慢）→ 查DB──→ 重建缓存
+              └─ 请求N → ...
+                                ↑ 所有请求同时穿透，数据库崩溃
+```
+
+#### 方案一：互斥锁（Mutex）
+
+只让一个线程去查 DB 重建缓存，其余线程自旋等待：
+
+```java
+public Product getProductWithMutex(Long id) {
+    String cacheKey = "cache:product:" + id;
+    String lockKey = "lock:product:" + id;
+
+    // 1. 先查缓存
+    String json = stringRedisTemplate.opsForValue().get(cacheKey);
+    if (StringUtils.hasText(json)) {
+        return JSON.parseObject(json, Product.class);
+    }
+
+    // 2. 缓存未命中，获取互斥锁
+    boolean isLock = false;
+    try {
+        // setIfAbsent = SETNX，返回 true 表示获取锁成功
+        isLock = Boolean.TRUE.equals(
+            stringRedisTemplate.opsForValue()
+                .setIfAbsent(lockKey, "1", 10, TimeUnit.SECONDS));
+
+        if (!isLock) {
+            // 未获取到锁，休眠后递归重试
+            Thread.sleep(50);
+            return getProductWithMutex(id);
+        }
+
+        // 3. 获取锁成功，Double Check 缓存
+        json = stringRedisTemplate.opsForValue().get(cacheKey);
+        if (StringUtils.hasText(json)) {
+            return JSON.parseObject(json, Product.class);
+        }
+
+        // 4. 查数据库 + 重建缓存
+        Product product = productMapper.selectById(id);
+        if (product != null) {
+            stringRedisTemplate.opsForValue()
+                .set(cacheKey, JSON.toJSONString(product), 30, TimeUnit.MINUTES);
+        }
+        return product;
+
+    } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        throw new RuntimeException(e);
+    } finally {
+        if (isLock) {
+            stringRedisTemplate.delete(lockKey); // 释放锁
+        }
+    }
+}
+```
+
+#### 方案二：逻辑过期（Logical TTL）
+
+缓存永不过期，Value 内包含 expire 字段。发现过期后异步重建，当前请求先返回旧数据：
+
+```java
+@Data
+public class RedisData {
+    private LocalDateTime expireTime; // 逻辑过期时间
+    private Object data;              // 实际数据
+}
+
+public Product getProductWithLogicalExpire(Long id) {
+    String cacheKey = "cache:product:" + id;
+    String lockKey = "lock:product:" + id;
+
+    // 1. 查缓存
+    String json = stringRedisTemplate.opsForValue().get(cacheKey);
+    if (!StringUtils.hasText(json)) {
+        return null; // 缓存中完全没有，返回空
+    }
+
+    // 2. 反序列化
+    RedisData redisData = JSON.parseObject(json, RedisData.class);
+    Product product = JSON.parseObject((String) redisData.getData(), Product.class);
+    LocalDateTime expireTime = redisData.getExpireTime();
+
+    // 3. 判断是否逻辑过期
+    if (expireTime.isAfter(LocalDateTime.now())) {
+        return product; // 未过期，直接返回
+    }
+
+    // 4. 逻辑过期 → 尝试获取互斥锁
+    boolean isLock = Boolean.TRUE.equals(
+        stringRedisTemplate.opsForValue()
+            .setIfAbsent(lockKey, "1", 10, TimeUnit.SECONDS));
+
+    if (isLock) {
+        // 5. 获取锁成功，开启独立线程异步重建缓存
+        threadPoolExecutor.submit(() -> {
+            try {
+                Product newProduct = productMapper.selectById(id);
+                RedisData newRedisData = new RedisData();
+                newRedisData.setData(JSON.toJSONString(newProduct));
+                newRedisData.setExpireTime(LocalDateTime.now().plusMinutes(30));
+                stringRedisTemplate.opsForValue()
+                    .set(cacheKey, JSON.toJSONString(newRedisData));
+            } finally {
+                stringRedisTemplate.delete(lockKey); // 释放锁
+            }
+        });
+    }
+
+    // 6. 无论是否获得锁，当前请求都返回旧数据（保证可用性）
+    return product;
+}
+```
+
+**互斥锁 vs 逻辑过期对比**：
+
+| 维度 | 互斥锁 | 逻辑过期 |
+|------|--------|----------|
+| **一致性** | 强一致，查到的永远是最新数据 | 最终一致，可能短期读到旧数据 |
+| **性能/QPS** | 线程需阻塞等待，吞吐量略降 | 零阻塞，性能最高 |
+| **实现复杂度** | 简单 | 较复杂（需线程池异步重建） |
+| **适用场景** | 金融/交易类系统 | 资讯/商品展示/社交类 |
+
+---
+
+### 1.3 缓存雪崩（Cache Avalanche）
+
+**核心概念**：极短时间内大量缓存 Key 同时到期失效，或 Redis 整个集群宕机，导致流量洪峰瞬间压向数据库。
+
+```
+正常状态：
+  Client → Redis(分散过期) → DB(低负载)
+
+雪崩状态：
+  Client → Redis(大量Key同时过期/集群宕机) → DB(过载崩溃) → 级联故障
+```
+
+#### 治理策略
+
+**策略一：随机扰动过期时间（TTL 打散）**
+
+```java
+public void setWithRandomTTL(String key, Object value, long baseMinutes) {
+    // 在基础过期时间上叠加随机 1~5 分钟
+    long randomMinutes = ThreadLocalRandom.current().nextLong(1, 6);
+    long ttl = baseMinutes + randomMinutes;
+
+    stringRedisTemplate.opsForValue()
+        .set(key, JSON.toJSONString(value), ttl, TimeUnit.MINUTES);
+}
+```
+
+**策略二：多级缓存架构**
+
+```
+┌─────────┐    ┌──────────────┐    ┌──────────────┐    ┌────────┐
+│ Nginx   │ →  │ 本地缓存       │ →  │ Redis 分布式  │ →  │ MySQL  │
+│ 限流    │    │ (Caffeine)    │    │ 缓存          │    │        │
+│         │    │ 命中率 ~60%   │    │ 命中率 ~35%   │    │ 兜底    │
+└─────────┘    └──────────────┘    └──────────────┘    └────────┘
+```
+
+```java
+@Configuration
+public class MultiLevelCacheConfig {
+
+    @Bean
+    public Cache<String, Object> localCache() {
+        return Caffeine.newBuilder()
+            .initialCapacity(100)
+            .maximumSize(10_000)
+            .expireAfterWrite(5, TimeUnit.MINUTES)
+            .recordStats()
+            .build();
+    }
+
+    public Object getWithMultiLevel(String key) {
+        // L1: 本地缓存
+        Object value = localCache().getIfPresent(key);
+        if (value != null) return value;
+
+        // L2: Redis 分布式缓存
+        String json = stringRedisTemplate.opsForValue().get(key);
+        if (json != null) {
+            localCache().put(key, JSON.parse(json));
+            return JSON.parse(json);
+        }
+
+        // L3: 数据库
+        Object dbValue = queryFromDB(key);
+        if (dbValue != null) {
+            // 回写 L2 + L1
+            stringRedisTemplate.opsForValue()
+                .set(key, JSON.toJSONString(dbValue), 30, TimeUnit.MINUTES);
+            localCache().put(key, dbValue);
+        }
+        return dbValue;
+    }
+}
+```
+
+**策略三：熔断降级**
+
+```java
+// 使用 Sentinel 对数据库查询接口做熔断保护
+@SentinelResource(value = "queryFromDB", fallback = "queryFallback")
+public Product queryFromDB(Long id) {
+    return productMapper.selectById(id);
+}
+
+// 降级方法：返回兜底数据
+public Product queryFallback(Long id, Throwable e) {
+    log.error("数据库查询熔断降级，id: {}", id, e);
+    return Product.DEFAULT; // 返回默认商品信息
+}
+```
+
+---
+
+## 二、Redis 持久化：RDB vs AOF
+
+理解 Redis 的持久化机制，是为了在性能和数据安全之间做出正确取舍：
+
+| 维度 | RDB（快照） | AOF（追加日志） |
+|------|-----------|---------------|
+| **原理** | 每隔一段时间将内存数据快照写入磁盘 | 将每条写命令追加到日志文件 |
+| **文件体积** | 压缩的二进制，体积小 | 文本协议，体积大（可重写压缩） |
+| **数据恢复速度** | 快，直接加载二进制 | 慢，需逐条重放命令 |
+| **数据安全** | 可能丢失最后两次快照间的数据 | 默认每秒 fsync，最多丢 1 秒数据 |
+| **影响性能** | fork 子进程时短暂阻塞 | 持续写盘，但可配置 fsync 策略 |
+| **恢复风险** | 快照文件损坏则全部丢失 | 日志可修复，更可靠 |
+
+### 生产环境推荐配置
+
+```conf
+# redis.conf
+# ===== RDB =====
+save 900 1      # 900 秒内至少 1 次修改则触发快照
+save 300 10     # 300 秒内至少 10 次修改则触发快照
+save 60 10000   # 60 秒内至少 10000 次修改则触发快照
+
+# ===== AOF =====
+appendonly yes
+appendfsync everysec       # 每秒 fsync 一次（推荐）
+auto-aof-rewrite-percentage 100  # AOF 文件增长 100% 时自动重写
+auto-aof-rewrite-min-size 64mb   # AOF 文件最小 64MB 才触发重写
+```
+
+**结论**：生产环境建议 **RDB + AOF 双开**，用 RDB 做快速恢复，用 AOF 保证数据不丢。
+
+---
+
+## 三、Redis 内存淘汰与过期策略
+
+### 过期键删除策略
+
+Redis 采用**惰性删除 + 定期删除**的组合策略：
+
+| 策略 | 机制 | 特点 |
+|------|------|------|
+| **惰性删除** | 访问 Key 时检查是否过期，过期则删除 | CPU 友好，内存不友好 |
+| **定期删除** | 每秒 10 次随机抽检一批 Key，过期比例 >25% 则继续抽检 | CPU 和内存的折中 |
+
+### 内存淘汰策略（8 种）
+
+当 Redis 内存达到 `maxmemory` 上限时，根据配置的策略淘汰 Key：
+
+| 策略 | 行为 | 适用场景 |
+|------|------|----------|
+| `noeviction` | 不淘汰，写入直接报错 | **不推荐**，会导致服务不可用 |
+| `allkeys-lru` | 所有 Key 中淘汰最久未使用的 | **通用缓存，推荐** |
+| `volatile-lru` | 有过期时间的 Key 中淘汰最久未使用的 | 需保留部分永久 Key |
+| `allkeys-lfu` | 所有 Key 中淘汰访问频率最低的 | 热点数据场景 |
+| `volatile-lfu` | 有过期时间的 Key 中淘汰访问频率最低 | 热点 + 永久 Key 混合 |
+| `allkeys-random` | 所有 Key 中随机淘汰 | 不常用 |
+| `volatile-random` | 有过期时间的 Key 中随机淘汰 | 不常用 |
+| `volatile-ttl` | 有过期时间的 Key 中淘汰 TTL 最短的 | 接近过期优先淘汰 |
+
+```conf
+# redis.conf 推荐配置
+maxmemory 4gb                      # 根据服务器内存设定上限
+maxmemory-policy allkeys-lru       # 通用场景推荐 LRU
+```
+
+---
+
+## 四、缓存与数据库一致性方案
+
+缓存和数据库的一致性是高并发架构的核心难题：
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                      缓存一致性模式                                │
+│                                                                  │
+│  Cache-Aside（旁路缓存）  Write-Through（写穿）  Write-Behind（写回）│
+│                                                                  │
+│  应用手动管理缓存        应用只写缓存             应用只写缓存       │
+│  读：缓存→DB            缓存同步写DB             缓存异步批量写DB   │
+│  写：更新DB→删缓存      写穿保证一致             延迟最高，风险最大  │
+│                                                                  │
+│  ★ 最常用，最灵活          一致性强                 高性能但可能丢数据│
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### 推荐方案：Cache-Aside + 延迟双删
+
+```java
+@Transactional
+public void updateProduct(Product product) {
+    String cacheKey = "cache:product:" + product.getId();
+
+    // 1. 先删除缓存
+    stringRedisTemplate.delete(cacheKey);
+
+    // 2. 更新数据库
+    productMapper.updateById(product);
+
+    // 3. 延迟双删：等待数据库主从同步完成后再次删除
+    //    防止并发读请求在此期间写入旧缓存
+    CompletableFuture.runAsync(() -> {
+        try {
+            Thread.sleep(500); // 等待时间 > 主从同步延迟
+            stringRedisTemplate.delete(cacheKey);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }, delayedExecutor);
+}
+```
+
+**Cache-Aside 口诀**：**读时加载，写时删除。先更库后删缓存，延迟双删保一致。**
+
+---
+
+## 五、Redisson 分布式锁与高级组件全景
+
+Redisson 不仅仅是一个 Redis 客户端，更是一个功能完备的分布式协调框架。
+
+### 5.1 Watchdog（看门狗）续期机制 — 核心内核
+
+Redisson 分布式锁采用 Redis 的 **Hash** 数据结构：
+
+```
+Key:   lock:order:1001
+Field: UUID:ThreadId (如 "a3f2b1-1")  ← 标识持锁线程
+Value: 3                              ← 重入次数（可重入）
+```
+
+```
+加锁时的 Lua 脚本逻辑：
+  if (redis.call('exists', KEYS[1]) == 0) then
+      redis.call('hincrby', KEYS[1], ARGV[2], 1);   -- Field+1（首次加锁）
+      redis.call('pexpire', KEYS[1], ARGV[1]);        -- 设 30s TTL
+      return nil;
+  elseif (redis.call('hexists', KEYS[1], ARGV[2]) == 1) then
+      redis.call('hincrby', KEYS[1], ARGV[2], 1);    -- 重入 +1
+      redis.call('pexpire', KEYS[1], ARGV[1]);        -- 续期
+      return nil;
+  end;
+  return redis.call('pttl', KEYS[1]);                  -- 锁被他人持有，返回剩余 TTL
+```
+
+**Watchdog 工作原理**：
+
+```
+加锁成功 → 开启定时任务（每 10 秒）
+    │
+    ├── 第 10 秒 → 检查锁是否仍被当前线程持有
+    │             → 是 → 发送 Lua 脚本续期到 30 秒
+    │
+    ├── 第 20 秒 → 再次检查并续期
+    │
+    └── ...循环直到 unlock() 或 JVM 宕机
+```
+
+**关键注意事项**：
+
+```java
+// ✅ 不指定 leaseTime → 看门狗自动续期（默认 30s）
+lock.lock();                    // 看门狗生效
+lock.tryLock(10, -1, TimeUnit.SECONDS); // leaseTime=-1，看门狗生效
+
+// ❌ 指定 leaseTime → 看门狗失效，锁到期强制释放
+lock.lock(10, TimeUnit.SECONDS); // 10 秒后必释放，看门狗不工作
+```
+
+### 5.2 Redisson 组件全家桶
+
+#### ① 可重入锁（Reentrant Lock）
+
+```java
+@Autowired
+private RedissonClient redisson;
+
+public void doBusinessWithLock() {
+    RLock lock = redisson.getLock("order:lock:1001");
+    try {
+        // tryLock(等待时间, 释放时间(-1=看门狗), 时间单位)
+        if (lock.tryLock(10, -1, TimeUnit.SECONDS)) {
+            // 执行业务逻辑
+        }
+    } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+    } finally {
+        if (lock.isHeldByCurrentThread()) {
+            lock.unlock(); // 重入次数归零才真正释放
+        }
+    }
+}
+```
+
+#### ② 公平锁（Fair Lock）
+
+```java
+RLock fairLock = redisson.getFairLock("order:fairLock");
+fairLock.lock();
+try {
+    // 线程严格按照请求顺序排队进入，杜绝"饥饿"
+} finally {
+    fairLock.unlock();
+}
+```
+
+#### ③ 读写锁（ReadWriteLock）
+
+```java
+RReadWriteLock rwLock = redisson.getReadWriteLock("product:rwLock");
+
+// 读操作 — 读读不互斥
+RLock readLock = rwLock.readLock();
+readLock.lock();
+try {
+    return productMapper.selectById(id);
+} finally {
+    readLock.unlock();
+}
+
+// 写操作 — 读写互斥、写写互斥
+RLock writeLock = rwLock.writeLock();
+writeLock.lock();
+try {
+    productMapper.updateById(product);
+} finally {
+    writeLock.unlock();
+}
+```
+
+| 锁关系 | 读锁 | 写锁 |
+|--------|------|------|
+| **读锁** | ✅ 不互斥（共享） | ❌ 互斥 |
+| **写锁** | ❌ 互斥 | ❌ 互斥 |
+
+#### ④ 红锁（RedLock）— 跨多节点
+
+```java
+// 适用于 Redis 集群环境，防止主从切换导致锁丢失
+RLock lock1 = redissonClient1.getLock("lock1");
+RLock lock2 = redissonClient2.getLock("lock2");
+RLock lock3 = redissonClient3.getLock("lock3");
+
+RLock redLock = redisson.getMultiLock(lock1, lock2, lock3);
+// 向 N 个独立节点申请加锁，成功 ≥ N/2+1 个才算加锁成功
+redLock.lock();
+try {
+    // 安全执行关键业务
+} finally {
+    redLock.unlock();
+}
+```
+
+#### ⑤ 信号量（Semaphore）
+
+```java
+RSemaphore semaphore = redisson.getSemaphore("db:connection:pool");
+semaphore.trySetPermits(10); // 最多 10 个并发
+
+semaphore.acquire(); // 获取许可，无许可时阻塞
+try {
+    // 执行受控操作
+} finally {
+    semaphore.release(); // 归还许可
+}
+```
+
+#### ⑥ CountDownLatch
+
+```java
+// 主服务等待 5 个子服务完成
+RCountDownLatch latch = redisson.getCountDownLatch("task:batch:sync");
+latch.trySetCount(5);
+
+// 各子服务完成后
+latch.countDown();
+
+// 主服务等待
+latch.await(30, TimeUnit.SECONDS);
+```
+
+#### ⑦ 限流器（RateLimiter）
+
+```java
+RRateLimiter limiter = redisson.getRateLimiter("api:user:rate");
+// 每 1 秒产生 100 个令牌
+limiter.trySetRate(RateType.OVERALL, 100, 1, RateIntervalUnit.SECONDS);
+
+if (limiter.tryAcquire()) {
+    // 获取令牌成功，执行业务
+} else {
+    throw new RateLimitException("请求过于频繁");
+}
+```
+
+#### ⑧ 布隆过滤器（RBloomFilter）
+
+```java
+RBloomFilter<String> bloomFilter = redisson.getBloomFilter("user:bloom");
+bloomFilter.tryInit(1_000_000L, 0.01); // 100 万预期，1% 误判率
+
+bloomFilter.add("user:1001");
+bloomFilter.contains("user:1001"); // true
+bloomFilter.contains("user:9999"); // false（大概率）
+```
+
+---
+
+## 六、Redis Pipeline 批量优化
+
+在网络延迟敏感的场景中，逐条命令的 RTT（往返时间）是性能杀手：
+
+```
+逐条执行：                  Pipeline 批量执行：
+Client → GET key1        Client → GET key1
+        ← value1                  GET key2
+Client → GET key2                 GET key3
+        ← value2                 ← value1, value2, value3
+Client → GET key3         一次 RTT，三条结果
+        ← value3
+3 次 RTT                  1 次 RTT
+```
+
+```java
+public List<Object> batchGet(List<String> keys) {
+    return stringRedisTemplate.executePipelined(
+        (RedisCallback<Object>) connection -> {
+            for (String key : keys) {
+                connection.stringCommands().get(key.getBytes());
+            }
+            return null; // 返回值由 executePipelined 收集
+        }
+    );
+}
+```
+
+**Pipeline 注意事项**：
+
+- Pipeline 不是原子操作 — 批中的命令可能与其他客户端的命令交错执行
+- 单次 Pipeline 不宜过大（建议 ≤ 1000 条），否则会长时间阻塞 Redis 单线程
+- 需要原子性用 Lua 脚本，需要吞吐量用 Pipeline
+
+---
+
+## 七、Redis 高可用架构
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│ 单机 → 主从 → Sentinel 哨兵 → Cluster 集群（演进路径）          │
+│                                                              │
+│  单机       主从复制     Sentinel        Cluster             │
+│  无高可用   读写分离     自动故障转移     数据分片 + 高可用    │
+│  数据可能丢  手动切换     3 节点起        3 主 3 从起          │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### 架构对比
+
+| 架构 | 高可用 | 数据分片 | 最小节点数 | 适用规模 |
+|------|--------|----------|-----------|----------|
+| **单机** | ❌ | ❌ | 1 | 开发/测试 |
+| **主从复制** | ❌（手动切换） | ❌ | 2 | 读写分离，小规模 |
+| **Sentinel 哨兵** | ✅ 自动故障转移 | ❌ | 3 | 中小规模生产 |
+| **Cluster 集群** | ✅ | ✅ 16384 槽位 | 6（3 主 3 从） | 大规模生产，TB 级数据 |
+
+### Sentinel 配置示例
+
+```conf
+# sentinel.conf（每个 Sentinel 节点配置相同）
+sentinel monitor mymaster 192.168.1.10 6379 2
+# ↑ 监控主节点，2 表示至少 2 个哨兵同意才进行故障转移
+
+sentinel down-after-milliseconds mymaster 5000
+# ↑ 主节点 5 秒无响应判定为下线
+
+sentinel failover-timeout mymaster 60000
+# ↑ 故障转移超时时间 60 秒
+
+sentinel parallel-syncs mymaster 1
+# ↑ 故障转移后，每次只允许 1 个从节点同步新主节点
+```
+
+---
+
+## 八、秒杀高并发业务全链路实战
+
+秒杀具有"瞬时高并发"、"读多写少"、"突发流量大"的特征。直接打 MySQL 必然崩溃。标准架构方案是：**Redis 拦截 99% 无效流量 + 消息队列异步落库**。
+
+### 8.1 秒杀架构黄金链路
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                          秒杀全链路架构                                 │
+│                                                                      │
+│  [用户请求]                                                           │
+│      │                                                               │
+│      ▼                                                               │
+│  [Nginx 层] ── 连接数限制 + 限流（limit_req）                           │
+│      │                                                               │
+│      ▼                                                               │
+│  [网关层]   ── 黑名单拦截 + IP 频次控制                                 │
+│      │                                                               │
+│      ▼                                                               │
+│  [Redis 层] ── Lua 脚本原子扣库存 + 用户幂等校验 + 预减库存               │
+│      │                                                               │
+│      ├── 抢购失败（库存不足/重复购买）→ 直接返回                           │
+│      │                                                               │
+│      ▼ 抢购成功                                                       │
+│  [消息队列] ── 发抢购凭证到 MQ，削峰填谷                                  │
+│      │                                                               │
+│      ▼                                                               │
+│  [订单服务] ── 异步消费，低频写 MySQL，生成真实订单                         │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+### 8.2 核心 Lua 脚本：原子扣库存 + 防超卖 + 限购
+
+```lua
+-- seckill.lua
+-- KEYS[1]: 商品库存 Key     (seckill:stock:1001)
+-- KEYS[2]: 已购用户集合 Key  (seckill:order:1001)
+-- ARGV[1]: 当前用户 ID
+
+local stockKey = KEYS[1]
+local orderKey = KEYS[2]
+local userId = ARGV[1]
+
+-- Step 1: 幂等校验 — 用户是否已抢购（限购 1 件）
+if redis.call('sismember', orderKey, userId) == 1 then
+    return -1  -- 重复购买
+end
+
+-- Step 2: 检查库存
+local currentStock = redis.call('get', stockKey)
+if not currentStock or tonumber(currentStock) <= 0 then
+    return 0   -- 库存不足
+end
+
+-- Step 3: 原子扣库存 + 记录用户
+redis.call('decr', stockKey)
+redis.call('sadd', orderKey, userId)
+
+return 1  -- 抢购成功
+```
+
+### 8.3 秒杀服务完整代码
+
+```java
+@Service
+@Slf4j
+public class SeckillServiceImpl implements SeckillService {
+
+    @Autowired
+    private StringRedisTemplate stringRedisTemplate;
+
+    @Autowired
+    private RabbitTemplate rabbitTemplate;
+
+    private DefaultRedisScript<Long> seckillScript;
+
+    @PostConstruct
+    public void initScript() {
+        seckillScript = new DefaultRedisScript<>();
+        seckillScript.setLocation(new ClassPathResource("seckill.lua"));
+        seckillScript.setResultType(Long.class);
+    }
+
+    @Override
+    public String executeSeckill(String skuId, String userId) {
+        // 1. 组装 Redis Key
+        String stockKey = "seckill:stock:" + skuId;
+        String orderKey = "seckill:order:" + skuId;
+
+        // 2. 执行 Lua 脚本（单线程原子操作）
+        Long result = stringRedisTemplate.execute(
+            seckillScript,
+            List.of(stockKey, orderKey),
+            userId
+        );
+
+        // 3. 根据返回值响应
+        if (result == null) {
+            log.error("秒杀脚本执行异常，skuId: {}, userId: {}", skuId, userId);
+            return "系统繁忙，请稍后再试";
+        }
+
+        switch (result.intValue()) {
+            case -1:
+                return "您已参与过该商品的秒杀活动，每人限购一件！";
+            case 0:
+                return "很遗憾，商品已被抢光！";
+            case 1:
+                // 4. Redis 预扣成功 → 发 MQ 异步下单
+                sendToMessageQueue(skuId, userId);
+                return "抢购成功！订单正在创建中，请稍后查看。";
+            default:
+                return "未知错误";
+        }
+    }
+
+    private void sendToMessageQueue(String skuId, String userId) {
+        SeckillMessageDTO message = new SeckillMessageDTO(skuId, userId);
+        rabbitTemplate.convertAndSend(
+            "seckill.exchange",
+            "seckill.order",
+            message
+        );
+        log.info("秒杀凭证已发送到 MQ，userId: {}, skuId: {}", userId, skuId);
+    }
+}
+```
+
+### 8.4 库存预热
+
+```java
+@Component
+public class SeckillStockPreloader {
+
+    @Autowired
+    private StringRedisTemplate stringRedisTemplate;
+
+    /**
+     * 秒杀活动开始前，将库存加载到 Redis
+     * 由运营后台或定时任务触发
+     */
+    public void preloadStock(String skuId, int totalStock) {
+        String stockKey = "seckill:stock:" + skuId;
+        String orderKey = "seckill:order:" + skuId;
+
+        // 设置库存
+        stringRedisTemplate.opsForValue().set(stockKey, String.valueOf(totalStock));
+        // 清空上轮已购用户集合
+        stringRedisTemplate.delete(orderKey);
+
+        log.info("秒杀库存预热完成，skuId: {}, 库存量: {}", skuId, totalStock);
+    }
+}
+```
+
+### 8.5 秒杀优化要点总结
+
+| 优化点 | 手段 | 效果 |
+|--------|------|------|
+| **库存扣减** | Lua 脚本原子操作，杜绝超卖 | 正确性保证 |
+| **限购防刷** | Redis Set 记录已购用户 | 一人一单 |
+| **流量削峰** | MQ 异步下单 | DB TPS 从 10000+ → 100 |
+| **库存预热** | 活动开始前 Redis 预加载 | Redis 纯内存，ns 级响应 |
+| **前端静默** | 按钮置灰 + 倒计时 + CDN | 拦截 50% 无效请求 |
+| **Nginx 限流** | `limit_req_zone` | 单 IP 限制 QPS |
+| **读库存分离** | 库存查询走本地缓存 | 不占用 Redis 连接 |
+
+---
+
+## 九、总结与最佳实践清单
+
+| 序号 | 实践要点 | 说明 |
+|------|----------|------|
+| ① | **TTL 必须加随机扰动** | `TTL = base + random(1~5分钟)`，杜绝雪崩 |
+| ② | **热点 Key 用逻辑过期** | 读多写少场景优先逻辑过期，0 阻塞 |
+| ③ | **金融场景用互斥锁** | 涉及金额/库存一致性用互斥锁 |
+| ④ | **Watchdog 不设 leaseTime** | 设 `leaseTime = -1` 或直接用 `lock()` 才能激活看门狗 |
+| ⑤ | **秒杀必须 Lua 脚本** | GET + DECR 分开执行必超卖 |
+| ⑥ | **Redisson unlock 加守护判断** | `isHeldByCurrentThread()` 判断，防止跨线程误解锁 |
+| ⑦ | **Pipeline 不保证原子性** | 需要原子性用 Lua，需要吞吐量用 Pipeline |
+| ⑧ | **生产必须配 maxmemory** | 防止 OOM 导致 Redis 不可用 |
+| ⑨ | **持久化 RDB + AOF 双开** | RDB 快速恢复 + AOF 数据安全 |
+| ⑩ | **写时删除缓存，延迟双删** | Cache-Aside 解决 99% 缓存一致性问题 |
+
+**记住一句话：缓存穿透靠布隆/空对象，缓存击穿靠互斥锁/逻辑过期，缓存雪崩靠随机 TTL + 多级缓存，秒杀靠 Lua 原子 + MQ 削峰。**
