@@ -1,0 +1,335 @@
+---
+title: "全栈进阶：前后端请求全链路流转与反向代理机制"
+slug: "fullstack-request-proxy"
+date: "2026-06-19"
+tags:
+  - Axios
+  - Vite
+  - Nginx
+  - Reverse Proxy
+  - Full-Stack
+category: "全栈"
+excerpt: "解构前后端分离架构下的请求全生命周期，对比开发环境 Vite 代理与生产环境 Nginx 反向代理的底层逻辑与配置落地。"
+published: true
+---
+
+在前后端分离的现代 Web 开发架构中，一个请求从用户点击按钮出发，到最终获取后端数据返回，中间经历了**前端封装、网络拦截、环境代理、路由转发**等多个核心环节。理解这一全链路流转逻辑，是攻克跨域问题、线上部署故障的基石。
+
+---
+
+## 核心流转图解
+
+在开发与生产环境中，请求的流转路径有着本质的区别。核心在于**"谁来扮演反向代理服务器"的角色**。
+
+### 开发环境流转（Vite 代理）
+
+```
+浏览器 ──→ Axios 拦截器（加 Token）──→ Vite 代理服务器 ──→ 后端真实服务器
+  ↑                                                          │
+  └──────────────── 响应原路返回 ─────────────────────────────┘
+```
+
+### 生产环境流转（Nginx 代理）
+
+```
+浏览器 ──→ Axios 拦截器（加 Token）──→ Nginx 反向代理 ──→ 后端真实服务器
+  ↑                                                          │
+  └──────────────── 响应原路返回 ─────────────────────────────┘
+```
+
+### 关键差异
+
+| 维度 | 开发环境 | 生产环境 |
+|------|----------|----------|
+| 代理服务器 | Vite Dev Server | Nginx |
+| 配置文件 | `vite.config.ts` | `nginx.conf` |
+| 启动方式 | `npm run dev` | `systemctl start nginx` |
+| 静态资源托管 | Vite HMR 热更新 | Nginx 的 `root` 指向 `dist/` |
+| 路径重写 | `rewrite()` 回调 | `proxy_pass` 末尾 `/` |
+
+---
+
+## 前端请求发起与拦截体系
+
+请求的起点位于前端的异步请求库封装（以 Axios 为例）。
+
+### 建立 Axios 实例与全局配置
+
+前端通常根据环境变量动态注入基础路径 `baseURL`：
+
+```javascript
+// request.js 或 service.js
+import axios from 'axios'
+
+const service = axios.create({
+  // 从环境变量中读取 API 的公共前缀（例如：/dev-api）
+  baseURL: import.meta.env.VITE_APP_BASE_API,
+  timeout: 10000 // 超时时间设置
+})
+```
+
+### 请求拦截器（Request Interceptor）
+
+在请求真正发送给浏览器网络层之前，对请求进行最后的统一加工：
+
+```javascript
+service.interceptors.request.use(
+  (config) => {
+    // 1. 动态追加凭证：从本地存储取出 Token，注入 Authorization 头
+    const token = localStorage.getItem('token')
+    if (token) {
+      config.headers.Authorization = `Bearer ${token}`
+    }
+
+    // 2. 防重复提交：可根据业务场景添加 loading 状态或取消重复请求
+    return config
+  },
+  (error) => {
+    return Promise.reject(error)
+  }
+)
+```
+
+### 浏览器网络转换
+
+当 Axios 发起请求时，浏览器会自动补全当前页面的协议、主机名（Domain/IP）和端口。
+
+示例：若本地页面运行在 `http://localhost:80`，Axios 请求的 URL 为 `/login`，经过 `baseURL: '/dev-api'` 拼接后，浏览器最终发出的完整真实请求地址为：
+
+```
+http://localhost:80/dev-api/login
+```
+
+---
+
+## 跨域问题与代理破局
+
+### 为什么需要代理？
+
+由于浏览器的**同源策略（Same-Origin Policy）**限制，如果前端页面（如 `http://localhost:80`）试图直接向不同源的后端接口（如 `http://127.0.0.1:8090`）发起 XHR/Fetch 请求，浏览器会出于安全考虑直接拦截响应。
+
+```
+前端 localhost:80 ──X──→ 后端 127.0.0.1:8090
+                  跨域被拦截
+```
+
+### 破局方案
+
+浏览器限制跨域，但**服务器与服务器之间的通信不受同源策略限制**。因此，我们需要在前端和后端之间架设一座"代理桥梁"：
+
+```
+前端 ──→ 代理服务器（同源）──→ 后端真实服务器（服务器间通信，不受限）
+```
+
+---
+
+## 开发环境：Vite 代理拦截
+
+在本地开发阶段，Vite 扮演了 Web 服务器和反向代理服务器的双重角色。
+
+### Vite 代理配置（vite.config.ts）
+
+当 Vite 监测到请求路径匹配了配置好的规则（如 `/dev-api`）时，它会在本地默默将请求拦截，并转换后转发给后端。
+
+```typescript
+import { defineConfig } from 'vite'
+
+export default defineConfig({
+  server: {
+    port: 80, // 监听本地端口
+    proxy: {
+      // 匹配所有以 /dev-api 开头的请求
+      '/dev-api': {
+        target: 'http://127.0.0.1:8090', // 目标后端服务器真实地址
+        changeOrigin: true,              // 允许跨域欺骗：修改请求头中的 Origin 为目标地址
+        rewrite: (path) => path.replace(/^\/dev-api/, '') // 路径重写：去掉 /dev-api 前缀
+      }
+    }
+  }
+})
+```
+
+### 路径流转实例
+
+```
+第 1 步 — 前端发出：http://localhost:80/dev-api/login
+
+第 2 步 — Vite 拦截：发现匹配 /dev-api 规则
+
+第 3 步 — 路径重写：去掉 /dev-api 变成 /login，拼接到 target 后面
+            → http://127.0.0.1:8090/login
+
+第 4 步 — 转发与返回：Vite 代替前端向后端要数据，拿到后塞回给前端
+            → 完美绕过浏览器跨域限制
+```
+
+---
+
+## 生产环境：Nginx 反向代理
+
+> 🚨 **核心痛点**：当项目打包（`npm run build`）部署到生产环境时，Vite 开发服务器不复存在，**所有的 Vite 代理全部失效**！此时必须引入高性能的反向代理服务器 — Nginx。
+
+### Nginx 承担的两项核心任务
+
+1. **托管前端静态资源**（dist 目录）
+2. **反向代理后端 API 接口**
+
+### Nginx 生产环境配置模板
+
+```nginx
+server {
+    listen       80;          # 监听生产环境端口
+    server_name  localhost;   # 域名或 IP
+
+    # 任务一：托管前端静态打包文件 (dist)
+    location / {
+        root   /your/path/dist;   # 修改为前端 dist 文件夹在服务器上的绝对路径
+        index  index.html index.htm;
+
+        # 核心：解决 SPA 前端路由刷新变 404 的问题
+        # 找不到资源时，统统导向 index.html，交由前端路由去处理
+        try_files $uri $uri/ /index.html;
+    }
+
+    # 任务二：把以 /dev-api 开头的请求转交给后端
+    location /dev-api/ {
+        # 开启反向代理，转发至后端真实的物理接口地址
+        # 末尾加 / 代表在转发时自动去掉 /dev-api/ 前缀
+        proxy_pass http://127.0.0.1:8080/;
+
+        # 透传客户端真实 IP 和 Host 信息，防止后端获取到的全是 Nginx 的本地 IP
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+```
+
+### proxy_pass 末尾斜杠的陷阱
+
+这是最容易踩的坑：
+
+| 配置 | 请求路径 | 转发路径 | 说明 |
+|------|----------|----------|------|
+| `proxy_pass http://127.0.0.1:8080/` | `/dev-api/login` | `http://127.0.0.1:8080/login` | 末尾有 `/`，去掉 `/dev-api/` 前缀 ✅ |
+| `proxy_pass http://127.0.0.1:8080` | `/dev-api/login` | `http://127.0.0.1:8080/dev-api/login` | 末尾无 `/`，完整拼接原路径 ❌ |
+
+---
+
+## 后端响应与前端响应拦截器
+
+当后端处理完业务（如验证密码、生成 JWT Token），数据按原路返回，最终回到前端的 Axios 环境中。
+
+### 响应拦截器（Response Interceptor）
+
+在 `.then()` 或 `await` 拿到数据之前，对数据进行统一的清洗和错误卡点：
+
+```javascript
+service.interceptors.response.use(
+  (response) => {
+    const res = response.data
+    // 假设后端约定的正常状态码为 200
+    if (res.code !== 200) {
+      Notification.error(res.message || '系统错误')
+      return Promise.reject(new Error(res.message || 'Error'))
+    }
+    // 过滤掉 Axios 包装的 status、headers 等，直接返回业务数据
+    return res
+  },
+  (error) => {
+    // 针对 HTTP 状态码的统一排错体系
+    if (error.response) {
+      switch (error.response.status) {
+        case 401:
+          // Token 过期或未登录：清理本地缓存，强制跳转登录页
+          logoutAndRedirect()
+          break
+        case 403:
+          Notification.error('你没有权限执行此操作')
+          break
+        case 500:
+          Notification.error('服务器内部错误，请联系管理员')
+          break
+        default:
+          Notification.error('网络连接异常')
+      }
+    }
+    return Promise.reject(error)
+  }
+)
+```
+
+### HTTP 状态码速查
+
+| 状态码 | 含义 | 前端处理策略 |
+|--------|------|-------------|
+| 200 | 成功 | 正常处理业务数据 |
+| 400 | 请求参数错误 | 提示用户修正输入 |
+| 401 | 未认证 | 清 Token，跳登录页 |
+| 403 | 无权限 | 提示权限不足 |
+| 404 | 接口不存在 | 提示资源不存在 |
+| 500 | 服务器内部错误 | 提示稍后重试 |
+
+---
+
+## 全链路完整流程图
+
+```
+┌──────────┐     ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+│  用户点击  │ →  │ Axios 请求拦截 │ →  │ 浏览器补全 URL │ →  │ 代理服务器接收 │
+│  按钮     │    │ 注入 Token    │    │ 拼接 baseURL  │    │ (Vite/Nginx)  │
+└──────────┘     └──────────────┘     └──────────────┘     └──────┬───────┘
+                                                                  │
+                                                         路径匹配 + 重写
+                                                                  │
+┌──────────┐     ┌──────────────┐     ┌──────────────┐     ┌──────┴───────┐
+│  更新 UI  │ ←  │ Axios 响应拦截 │ ←  │  浏览器接收   │ ←  │  后端处理请求 │
+│  展示数据  │    │ 统一错误处理   │    │  HTTP 响应    │    │  返回业务数据 │
+└──────────┘     └──────────────┘     └──────────────┘     └──────────────┘
+```
+
+---
+
+## 避坑与最佳实践指南
+
+### 1. Vite 代理与 Nginx 代理的路径重写差异
+
+| 环境 | 重写方式 | 配置位置 |
+|------|----------|----------|
+| Vite（开发） | `rewrite: (path) => path.replace(...)` 显式去除前缀 | `vite.config.ts` |
+| Nginx（生产） | `proxy_pass` URL 末尾的 `/` 自动去除匹配路径 | `nginx.conf` 的 `location` 块 |
+
+### 2. 环境变量不可混淆
+
+生产环境下的 `VITE_APP_BASE_API` **不要**写成带 `http://...` 的绝对路径：
+
+```bash
+# ❌ 错误：生产环境请求会直接打到这个地址，绕过 Nginx 代理
+VITE_APP_BASE_API=http://192.168.1.100:8080
+
+# ✅ 正确：保持相对路径，让请求发送到同源的 Nginx，由 Nginx 转发
+VITE_APP_BASE_API=/prod-api
+```
+
+### 3. SPA 路由刷新 404
+
+Nginx 必须配置 `try_files $uri $uri/ /index.html;`，否则用户直接访问 `/posts/123` 或刷新页面时 Nginx 会去找真实的文件，找不到就返回 404。
+
+### 4. 代理透传真实 IP
+
+不加 `proxy_set_header` 时，后端拿到的 `X-Real-IP` 永远是 `127.0.0.1`（Nginx 的 IP），导致无法追踪真实请求来源。
+
+---
+
+## 总结
+
+全栈请求流转的核心知识链：
+
+1. **Axios 封装**：统一 `baseURL`、Token 注入、错误处理
+2. **跨域本质**：浏览器的同源策略限制，用服务器端代理绕过
+3. **开发环境**：Vite 的 `proxy` 配置，`rewrite()` 重写路径
+4. **生产环境**：Nginx 的 `location` + `proxy_pass`，注意末尾 `/`
+5. **响应拦截**：统一提取 `response.data`，按状态码分类处理错误
+
+记住一句话：**开发靠 Vite，生产靠 Nginx，两套代理逻辑各自独立，部署时记得切换。**

@@ -1,0 +1,245 @@
+---
+title: "支付宝小程序授权登录全链路架构与落地实践"
+slug: "alipay-miniprogram-login"
+date: "2026-06-19"
+tags:
+  - Alipay
+  - MiniProgram
+  - Authentication
+  - Redis
+category: "全栈"
+excerpt: "深入剖析支付宝小程序 auth_code 登录流程，详解基于 OpenID 的用户留存、高并发幂等处理，以及自定义第三方 Session 的安全设计。"
+published: true
+---
+
+与微信生态类似，支付宝小程序同样遵循"利用临时凭证换取永久唯一标识，再通过自定义会话维持登录状态"的安全设计哲学。其核心区别主要体现在开放平台的接口规范与术语上。
+
+---
+
+## 支付宝登录核心时序架构
+
+支付宝官方推荐的登录流程同样是一个典型的"三角交互"模型，利用授权码进行无感静默登录：
+
+```
+小程序前端                开发者后端                支付宝开放平台
+    │                        │                        │
+    │── 1. my.getAuthCode() →│                        │
+    │   获取临时 auth_code    │                        │
+    │                        │── 2. oauth.token ─────→│
+    │                        │   appId + 私钥签名       │
+    │                        │   + auth_code           │
+    │                        │                        │
+    │                        │←── 3. openId ──────────│
+    │                        │   + userId (旧版UID)     │
+    │                        │   + access_token        │
+    │                        │                        │
+    │                        │── 4. 查库/注册用户      │
+    │                        │── 5. 生成自定义 Token   │
+    │                        │── 6. 存入 Redis         │
+    │                        │                        │
+    │←── 7. 返回自定义Token ─│                        │
+```
+
+---
+
+## 术语对齐：OpenID vs USER_ID
+
+支付宝官方目前已全面推行全新的 **OpenID**（应用级用户标识）来替代传统的 **USER_ID**（2088 开头的全局用户标识），以保护用户隐私。这与微信的 `OpenID` 概念已完全一致。
+
+| 标识 | 格式 | 说明 |
+|------|------|------|
+| **OpenID**（新） | 不定长字符串 | 应用级用户标识，同一用户在不同应用下 OpenID 不同，**推荐使用** |
+| **USER_ID**（旧） | 2088 开头的 16 位数字 | 全局用户标识，已不推荐直接暴露 |
+
+---
+
+## 核心技术环节与源码级解析
+
+### 第一步：临时凭证换取会话对象
+
+前端通过调用 `my.getAuthCode` 拿到一个只能使用一次的授权码 `auth_code`（通常作用域设为 `auth_base` 即可实现静默登录）。后端使用支付宝官方 SDK 发起远程调用。
+
+```java
+// 使用支付宝官方 SDK（alipay-sdk-java）
+AlipayClient alipayClient = new DefaultAlipayClient(
+    "https://openapi.alipay.com/gateway.do",
+    appId, privateKey, "json", "UTF-8", alipayPublicKey, "RSA2"
+);
+
+AlipaySystemOauthTokenRequest request = new AlipaySystemOauthTokenRequest();
+request.setGrantType("authorization_code");
+request.setCode(authCode); // 前端传来的临时凭证
+
+AlipaySystemOauthTokenResponse response = alipayClient.execute(request);
+
+// 从 response 中可以获取核心参数：
+// 1. response.getOpenId()   — 用户在该应用下的唯一、永久标识（推荐使用）
+// 2. response.getUserId()   — 2088 开头的支付宝用户 UID（旧版，不推荐直接暴露）
+// 3. response.getAccessToken() — 用于后续调用其他高级接口的令牌
+```
+
+### 第二步：用户留存与并发幂等处理
+
+拿到支付宝的 openId 后，去数据库检索用户。针对首次登录的新用户，同样需要防范多端同时登录引发的**并发插入重复**问题。
+
+```java
+WxUser user = this.getByAlipayOpenId(response.getOpenId());
+
+if (user == null) {
+    user = new WxUser();
+    user.setAppType(ConfigConstant.ALIPAY_APP_TYPE_2); // 标记来源为支付宝小程序
+    user.setAlipayOpenId(response.getOpenId());
+    user.setAlipayAccessToken(response.getAccessToken());
+
+    try {
+        this.save(user);
+    } catch (DuplicateKeyException e) {
+        // 并发冲突：唯一索引 uk_appid_alipay_openid 限制
+        // 如果冲突，说明已有并发线程创建成功，直接反查即可
+        if (e.getMessage().contains("uk_appid_alipay_openid")) {
+            user = this.getByAlipayOpenId(user.getAlipayOpenId());
+        } else {
+            throw e;
+        }
+    }
+} else {
+    // 老用户登录：更新最新的 AccessToken
+    user.setAlipayAccessToken(response.getAccessToken());
+    this.updateById(user);
+}
+```
+
+### 第三步：自定义第三方会话（ThirdSession）
+
+出于相同的安全规范，绝对不允许将支付宝返回的 `accessToken` 直接下发给前端。后端同样需要生成一个随机的 Token 并挂载到 Redis 中。
+
+```java
+// 1. 生成自定义 Token
+String thirdSessionKey = UUID.randomUUID().toString();
+
+// 2. 构建 Session 承载的对象
+ThirdSession thirdSession = new ThirdSession();
+thirdSession.setAppId(appId);
+thirdSession.setOpenId(user.getAlipayOpenId());
+thirdSession.setWxUserId(user.getId()); // 关联系统内部的统一用户 ID
+
+// 3. 存入 Redis 并设置 7 天有效期
+redisTemplate.opsForValue().set(
+    "SESSION:" + thirdSessionKey,
+    thirdSession,
+    7,
+    TimeUnit.DAYS
+);
+```
+
+---
+
+## 响应数据脱敏结构
+
+向前端返回数据时，屏蔽掉所有支付宝侧的敏感字段，统一暴露出系统的自定义 sessionKey：
+
+```json
+{
+  "id": "user_099",
+  "alipayOpenId": "208812345678901234567890",
+  "sessionKey": "f8c9b3e1-45a2-9b8c-7d6e-123456789abc",
+  "appType": 2,
+  "createTime": "2026-06-19 14:15:00"
+}
+```
+
+> **注意**：返回的 `sessionKey` 是系统自定义 Token，**不是**支付宝的 `access_token`。
+
+---
+
+## 微信与支付宝小程序登录大比拼
+
+两者在架构设计上是互通的，但细节上有以下关键差异：
+
+| 维度 | 微信小程序 | 支付宝小程序 |
+|------|-----------|-------------|
+| 获取临时凭证 API | `wx.login()` | `my.getAuthCode()` |
+| 临时凭证名称 | `js_code` | `auth_code` |
+| 后端换取会话的接口 | `auth.code2Session` | `alipay.system.oauth.token` |
+| 会话级密钥 | `session_key`（需妥善保存） | 无类似密钥，改用 `access_token` |
+| 用户唯一标识 | `openid` + 可选 `unionid` | `openId`（新）+ `userId`（旧） |
+| 跨应用打通 | `UnionID`（需绑定开放平台） | `UnionID`（支付宝同样支持多应用绑定） |
+| 静默登录体验 | 天然静默，用户无感知 | 需指定 scopes 为 `auth_base` 才能无感 |
+| SDK 生态 | WxJava（社区活跃） | alipay-sdk-java（官方维护） |
+| 签名方式 | MD5 / HMAC-SHA256 | RSA2（非对称加密） |
+| 网关地址 | `api.weixin.qq.com` | `openapi.alipay.com/gateway.do` |
+
+---
+
+## 核心避坑要点
+
+### 1. 沙箱环境陷阱
+
+支付宝的真实网关是 `https://openapi.alipay.com/gateway.do`。如果在本地测试由于没有企业资质，需要切换到沙箱环境，此时**所有配置都需要换成沙箱专用**：
+
+| 配置项 | 生产环境 | 沙箱环境 |
+|--------|----------|----------|
+| 网关 URL | `openapi.alipay.com/gateway.do` | `openapi-sandbox.dl.alipaydev.com/gateway.do` |
+| appId | 正式应用 ID | 沙箱应用 ID |
+| 私钥 | 正式应用私钥 | 沙箱应用私钥 |
+| 支付宝公钥 | 正式支付宝公钥 | 沙箱支付宝公钥 |
+
+### 2. SDK 依赖引入
+
+微信生态有很多第三方开源 SDK（如 WxJava），而支付宝项目通常直接引入阿里官方提供的 `alipay-sdk-java` 即可，最新版已全量支持 EasySDK 链式调用写法，代码会精简很多。
+
+```xml
+<!-- 支付宝官方 SDK -->
+<dependency>
+    <groupId>com.alipay.sdk</groupId>
+    <artifactId>alipay-sdk-java</artifactId>
+    <version>4.39.20.ALL</version>
+</dependency>
+```
+
+### 3. 多端用户合并（全栈终极通病）
+
+如果你的项目同时存在微信小程序和支付宝小程序，用户可能用不同渠道登录。如何把两个账号合并成同一个？
+
+**标准解法**：
+
+```
+支付宝用户登录 → 触发手机号授权 → 后端通过手机号查库
+    ↓
+该手机号已绑定微信用户？
+    ↓ 是
+将 alipay_open_id 合并到已有用户记录中
+    ↓
+用户下次无论用微信还是支付宝登录，都指向同一个账号
+```
+
+```java
+// 合并逻辑伪代码
+String phone = getPhoneNumberFromAlipay(authCode);
+WxUser existingUser = userService.getByPhone(phone);
+
+if (existingUser != null) {
+    // 手机号已被微信用户注册，将支付宝身份合并进来
+    existingUser.setAlipayOpenId(alipayOpenId);
+    existingUser.setAlipayAccessToken(accessToken);
+    userService.updateById(existingUser);
+    return existingUser; // 以最早注册的账号为准
+} else {
+    // 独立新用户，正常注册
+    return createNewAlipayUser(alipayOpenId, accessToken, phone);
+}
+```
+
+---
+
+## 总结
+
+支付宝小程序登录与微信的核心差异就三点：
+
+1. **临时凭证名不同**：`auth_code` vs `js_code`，但换取永久标识的思路完全一样
+2. **签名机制不同**：支付宝用 RSA2 非对称加密，微信用 MD5/HMAC
+3. **没有 session_key 概念**：支付宝用 `access_token` 替代，安全设计上少了一层密钥管理
+
+其余的用户留存、并发幂等、自定义 Token、Redis 存储、ThreadLocal 上下文 — 和微信那套完全一样，照着搬就行。
+
+**记住**：沙箱环境测试时网关、密钥、appId 必须全套切换，上线前务必切回生产配置。

@@ -1,0 +1,292 @@
+---
+title: "微信小程序授权登录全链路架构与落地实践"
+slug: "wechat-miniprogram-login"
+date: "2026-06-19"
+tags:
+  - WeChat
+  - MiniProgram
+  - Authentication
+  - Redis
+category: "全栈"
+excerpt: "深入剖析微信小程序 code2Session 登录流程，详解基于 OpenID 的用户留存、并发唯一索引冲突解决，以及自定义第三方 Session 的安全设计。"
+published: true
+---
+
+微信小程序的登录流转与传统的"用户名+密码"或"手机号验证码"不同，它依赖于微信生态提供的安全凭证交互机制。其核心逻辑在于：**利用临时凭证换取永久唯一标识，再通过自定义会话维持登录状态。**
+
+---
+
+## 微信登录核心时序架构
+
+微信官方推荐的标准登录流程是一个典型的"三角交互"模型：
+
+```
+小程序前端                开发者后端                微信服务器
+    │                        │                        │
+    │── 1. wx.login() ──────→│                        │
+    │   获取临时 js_code      │                        │
+    │                        │── 2. code2Session ────→│
+    │                        │   appId + appSecret     │
+    │                        │   + js_code            │
+    │                        │                        │
+    │                        │←── 3. openid ──────────│
+    │                        │   + session_key         │
+    │                        │   + unionid (可选)      │
+    │                        │                        │
+    │                        │── 4. 查库/注册用户      │
+    │                        │── 5. 生成自定义 Token   │
+    │                        │── 6. 存入 Redis         │
+    │                        │                        │
+    │←── 7. 返回自定义Token ─│                        │
+    │                        │                        │
+    │── 8. 后续请求携带 ────→│                        │
+    │    X-Token 在 Header   │── 查 Redis 验证会话     │
+```
+
+---
+
+## 核心技术环节与源码级解析
+
+### 第一步：临时凭证换取微信会话对象
+
+前端通过 `wx.login()` 拿到一个**只能使用一次、且有效期极短（约 5 分钟）**的 `js_code`。后端结合小程序的 `appId` 和 `appSecret` 向微信服务器发起请求。
+
+```java
+// 使用 WxMaService（以二进制 WxJava SDK 为例）换取微信会话信息
+WxMaJscode2SessionResult jscode2session =
+    WxMaConfiguration.getMaService(appId).jsCode2SessionInfo(jsCode);
+
+// 从中可以获取三个核心参数：
+// 1. openid      — 用户在该小程序下的唯一、永久标识
+// 2. session_key — 微信加密签名密钥，用于解密用户敏感数据（如手机号）
+// 3. unionid     — 同一微信开放平台主体下的唯一标识（跨应用追踪用户必备）
+```
+
+### 第二步：用户留存与高并发幂等处理
+
+拿到 openid 后，首先去数据库中检索用户是否存在。针对新用户首次登录，在高并发场景下可能会触发**并发插入重复**的问题。
+
+```java
+WxUser wxUser = this.getByOpenId(jscode2session.getOpenid());
+
+if (wxUser == null) {
+    // 新用户：构造实体并尝试入库
+    wxUser = new WxUser();
+    wxUser.setAppType(ConfigConstant.WX_APP_TYPE_1);
+    wxUser.setOpenId(jscode2session.getOpenid());
+    wxUser.setSessionKey(jscode2session.getSessionKey());
+    wxUser.setUnionId(jscode2session.getUnionid());
+
+    try {
+        this.save(wxUser);
+    } catch (DuplicateKeyException e) {
+        // 关键：并发场景下多个请求同时到达，查的时候都是 null
+        // 数据库层面由于 uk_appid_openid 唯一索引限制，后到的请求会抛异常
+        // 解决：捕获异常后，重新从数据库捞取先一步插入成功的数据
+        if (e.getMessage().contains("uk_appid_openid")) {
+            wxUser = this.getByOpenId(wxUser.getOpenId());
+        } else {
+            throw e;
+        }
+    }
+} else {
+    // 老用户登录：微信每次重新下发的 session_key 都会变，必须及时更新
+    wxUser.setSessionKey(jscode2session.getSessionKey());
+    wxUser.setUnionId(jscode2session.getUnionid());
+    this.updateById(wxUser);
+}
+```
+
+### 第三步：自定义第三方会话（ThirdSession）设计
+
+> 🚨 **微信安全规范警告**：绝对不能将微信官方返回的 `session_key` 直接下发给前端，否则会导致用户加密数据泄露、遭遇重放攻击。
+
+为了安全，后端必须自己在内存/缓存中生成一个自定义登录态（如 UUID 或 JWT），作为一把"虚假的钥匙"给前端。
+
+```java
+// 1. 生成第三方会话键（Token）
+String thirdSessionKey = UUID.randomUUID().toString();
+
+// 2. 构建 Session 承载的对象
+ThirdSession thirdSession = new ThirdSession();
+thirdSession.setAppId(appId);
+thirdSession.setSessionKey(wxUser.getSessionKey()); // 妥善保管真实的 session_key
+thirdSession.setWxUserId(wxUser.getId());
+thirdSession.setOpenId(wxUser.getOpenId());
+
+// 3. 序列化并存入 Redis，设置合理过期时间（如 7 天）
+redisTemplate.opsForValue().set(
+    "SESSION:" + thirdSessionKey,
+    thirdSession,
+    7,
+    TimeUnit.DAYS
+);
+```
+
+#### ThirdSession 实体定义
+
+```java
+public class ThirdSession implements Serializable {
+    private String appId;      // 小程序 AppID
+    private String sessionKey; // 真实的微信 sessionKey（敏感，仅内网可见）
+    private String wxUserId;   // 系统的用户自增/分布式 ID
+    private String openId;     // 微信 openid
+}
+```
+
+#### Redis Key 设计
+
+| Key 格式 | Value | TTL | 说明 |
+|----------|-------|-----|------|
+| `SESSION:{token}` | ThirdSession 序列化对象 | 7 天 | 自定义会话 |
+| `TOKEN:{userId}` | token 值 | 7 天 | 用户 → Token 的反向映射 |
+
+---
+
+## 响应数据脱敏结构
+
+向前端返回数据时，将原有的 `session_key` 字段用刚才生成的 `thirdSessionKey` 进行替换（脱敏）：
+
+```json
+{
+  "id": "user_001",
+  "openId": "oXYZ1234567890",
+  "unionId": "uABC1234567890",
+  "sessionKey": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "appType": 1,
+  "createTime": "2026-01-20 10:30:00"
+}
+```
+
+> **注意**：返回给前端的 `sessionKey` 实际上是第三方会话自定义 Key（Token），不是微信真实的 `session_key`。
+
+---
+
+## 后续请求的拦截器与上下文存储体系
+
+当登录成功后，前端会将这个 Token 保存到本地，并在后续发起业务请求时，统一放入 Request Headers（通常命名为 `Authorization` 或 `X-Token`）。
+
+### 拦截器验证流转逻辑
+
+```java
+public class WeChatAuthInterceptor implements HandlerInterceptor {
+
+    @Autowired
+    private RedisTemplate redisTemplate;
+
+    @Override
+    public boolean preHandle(HttpServletRequest request,
+                             HttpServletResponse response,
+                             Object handler) throws Exception {
+        // 1. 从请求头获取自定义会话键
+        String token = request.getHeader("X-Token");
+        if (StrUtil.isEmpty(token)) {
+            throw new UnAuthorizedException("未检测到登录凭证");
+        }
+
+        // 2. 去 Redis 中查询对应的 ThirdSession 对象
+        ThirdSession session = (ThirdSession) redisTemplate
+            .opsForValue().get("SESSION:" + token);
+        if (session == null) {
+            throw new UnAuthorizedException("登录态已过期，请重新登录");
+        }
+
+        // 3. 有效则存入本地线程上下文（ThreadLocal）
+        //    方便整个请求链路随时随地获取当前用户信息
+        UserContext.setSession(session);
+        return true;
+    }
+
+    @Override
+    public void afterCompletion(HttpServletRequest request,
+                                HttpServletResponse response,
+                                Object handler, Exception ex) throws Exception {
+        // 4. 请求结束时，务必清理 ThreadLocal，防止内存泄漏
+        UserContext.clear();
+    }
+}
+```
+
+### ThreadLocal 上下文工具类
+
+```java
+public class UserContext {
+    private static final ThreadLocal<ThirdSession> SESSION_HOLDER = new ThreadLocal<>();
+
+    public static void setSession(ThirdSession session) {
+        SESSION_HOLDER.set(session);
+    }
+
+    public static ThirdSession getSession() {
+        return SESSION_HOLDER.get();
+    }
+
+    public static String getOpenId() {
+        ThirdSession session = getSession();
+        return session != null ? session.getOpenId() : null;
+    }
+
+    public static void clear() {
+        SESSION_HOLDER.remove();
+    }
+}
+```
+
+---
+
+## 核心避坑要点
+
+### 1. 唯一索引保护
+
+数据库中用户表的 `openid` **必须建立 UNIQUE KEY**（如 `uk_appid_openid`）。单纯靠 Java 层的 `if (user == null)` 在大流量并发下形同虚设。
+
+```sql
+ALTER TABLE wx_user ADD CONSTRAINT uk_appid_openid UNIQUE (app_id, open_id);
+```
+
+### 2. 解密失败（PAD_BLOCK_CORRUPTED）
+
+如果后续业务需要调用微信获取手机号等敏感信息，必须使用存储在 Redis 中的对应 `session_key`。**致命场景**：
+
+```
+前端调用 wx.login() → 拿到 code A → 发给后端
+后端用 code A 换取 session_key_1，存入 Redis
+前端又调用 wx.login() → 拿到 code B
+         ↑ ↑ ↑
+微信服务器立即刷新 session_key → session_key_1 作废！
+         ↓ ↓ ↓
+前端用旧 code 调用 getPhoneNumber → 后端用 session_key_1 解密
+→ PAD_BLOCK_CORRUPTED（解密失败）！
+```
+
+**解决方案**：整个登录流程中只在最开始调用一次 `wx.login()`；获取手机号等敏感操作必须在登录流程之后、再次 `wx.login()` 之前完成。
+
+### 3. session_key 永不暴露
+
+前端拿到的 Token 是后端自己生成的 UUID，前端**永远不知道**微信真实的 `session_key` 是什么。这是一个核心安全设计原则。
+
+---
+
+## 完整登录链路总结
+
+```
+步骤  角色          动作
+─────────────────────────────────────────────────────
+ 1    前端           wx.login() 获取临时 js_code
+ 2    前端           将 js_code 发送给后端
+ 3    后端           用 appId + appSecret + js_code
+                    调用微信 code2Session 接口
+ 4    后端           拿到 openid + session_key + unionid
+ 5    后端           查数据库，新用户注册，老用户更新 session_key
+                    通过唯一索引 + 异常捕获处理并发冲突
+ 6    后端           生成 UUID 作为自定义 Token
+ 7    后端           将真实 session_key 存入 Redis（Token 为 Key）
+ 8    后端           返回 Token 给前端（而非真实 session_key）
+ 9    前端           存储 Token 到本地
+10    前端           后续请求 Header 携带 X-Token
+11    拦截器         从 Redis 校验 Token → 注入 ThreadLocal
+12    业务代码       通过 UserContext.getSession() 获取用户信息
+13    请求结束       拦截器清理 ThreadLocal
+```
+
+记住一句话：**用临时 code 换永久 openid，用自定义 Token 替换真实 session_key，用唯一索引 + 异常捕获处理并发，用 ThreadLocal 传递上下文。**

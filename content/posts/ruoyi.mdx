@@ -1,0 +1,389 @@
+---
+title: "RuoYi-Vue 核心架构解析：安全认证与动态权限流转体系"
+slug: "ruoyi-vue-security-architecture"
+date: "2026-06-19"
+tags:
+  - RuoYi
+  - SpringSecurity
+  - JWT
+  - Redis
+  - Vue
+category: "Java"
+excerpt: "深度解构 RuoYi 框架的登录双重验证机制、前端路由与权限初始化（getInfo/getRouters）以及基于 Spring Security 的 JWT 过滤器拦截器体系。"
+published: true
+---
+
+RuoYi-Vue（前后端分离版）底层安全架构基于 **Spring Security + JWT + Redis** 协同实现。理解 RuoYi 的核心在于把握：**后端无状态 Token 与 Redis 缓存的结合、以及前端动态路由的加载时机。**
+
+---
+
+## 核心认证与数据流转全景图
+
+RuoYi 的安全认证可以严密地划分为三个闭环阶段：
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                          阶段一：登录认证                              │
+│                                                                     │
+│  前端 ──→ /captchaImage ──→ 后端生成验证码 ──→ Redis(uuid → code)     │
+│  前端 ──→ /login ──→ 验证码校验 → 账密认证 → JWT Token ←── Redis      │
+│                                                                     │
+├─────────────────────────────────────────────────────────────────────┤
+│                          阶段二：信息拉取                              │
+│                                                                     │
+│  页面刷新 → 路由守卫 → getInfo(用户/角色/权限) → getRouters(动态菜单)    │
+│                                                                     │
+├─────────────────────────────────────────────────────────────────────┤
+│                          阶段三：拦截验权                              │
+│                                                                     │
+│  每次请求 → JWT过滤器 → Redis校验Token → 续期 → 注入SecurityContext     │
+│          → @PreAuthorize 权限注解校验 → Controller                    │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 阶段一：登录双重验证机制
+
+用户在前端点击登录时，后端并非直接校验账密，而是先进行防机器暴破的验证码校验。
+
+### 验证码获取阶段
+
+```java
+// /captchaImage 接口核心逻辑
+@GetMapping("/captchaImage")
+public AjaxResult getCode() {
+    // 1. 生成随机验证码文本（如 "4852"）并绘制成图片
+    String code = captchaProducer.createText();
+    BufferedImage image = captchaProducer.createImage(code);
+
+    // 2. 生成唯一 uuid，作为 Redis Key
+    String uuid = IdUtils.simpleUUID();
+
+    // 3. 存入 Redis，设置 2 分钟过期
+    redisCache.setCacheObject(CAPTCHA_CODE_KEY + uuid, code,
+                              Constants.CAPTCHA_EXPIRATION, TimeUnit.MINUTES);
+
+    // 4. 返回图片 Base64 + uuid
+    AjaxResult ajax = AjaxResult.success();
+    ajax.put("uuid", uuid);
+    ajax.put("img", Base64.encode(os.toByteArray()));
+    return ajax;
+}
+```
+
+**关键设计**：验证码文本存在 Redis，uuid 发给前端。后端**只认 uuid → Redis → 验证码**这条链路，前端传来的验证码文本不与后端直接比对。
+
+### 账密认证与 Token 生成阶段
+
+前端组装表单数据 `{ username, password, code, uuid }` 发送至 `/login` 接口。
+
+```java
+// /login 接口核心逻辑（简化）
+@PostMapping("/login")
+public AjaxResult login(@RequestBody LoginBody loginBody) {
+    // 第一重验证：验证码校验
+    String verifyKey = CAPTCHA_CODE_KEY + loginBody.getUuid();
+    String captcha = redisCache.getCacheObject(verifyKey);
+    if (captcha == null || !captcha.equalsIgnoreCase(loginBody.getCode())) {
+        throw new CaptchaException("验证码错误");
+    }
+
+    // 第二重验证：账密认证（交给 Spring Security 的 AuthenticationManager）
+    Authentication authentication = authenticationManager.authenticate(
+        new UsernamePasswordAuthenticationToken(loginBody.getUsername(),
+                                                loginBody.getPassword())
+    );
+
+    // 认证通过后，生成 Token
+    LoginUser loginUser = (LoginUser) authentication.getPrincipal();
+    String token = tokenService.createToken(loginUser);
+
+    return AjaxResult.success().put("token", token);
+}
+```
+
+### Token 生成与存储的双层结构
+
+```
+┌──────────────────────────────────────────────┐
+│                  JWT Token                    │
+│  ┌─────────────────────────────────────────┐ │
+│  │  Payload: { "login_user_key": "uuid" }  │ │  ← 仅做加密传输载体
+│  └─────────────────────────────────────────┘ │
+└──────────────────────────────────────────────┘
+              │
+              │ uuid 关联
+              ▼
+┌──────────────────────────────────────────────┐
+│              Redis 存储                       │
+│  Key: "login_tokens:" + uuid                 │
+│  Value: LoginUser 对象                       │  ← 真正的用户会话数据
+│  TTL: 30 分钟（有访问时自动续期）               │
+└──────────────────────────────────────────────┘
+```
+
+**核心设计理念**：JWT 本身不设过期时间（或极长），只做加密传输 `uuid` 的载体。**真正的过期控制完全由 Redis TTL 掌握**。这解决了纯 JWT 无法主动踢人下线、无法主动注销的致命缺陷。
+
+---
+
+## 阶段二：页面刷新与权限 / 路由初始化
+
+由于前后端分离架构中，前端页面刷新会导致内存数据丢失，Vue 的路由守卫（`permission.js`）会在每次刷新时触发身份与权限的重新拉取。
+
+### getInfo — 拉取身份与权限
+
+```javascript
+// permission.js 路由守卫（简化）
+router.beforeEach(async (to, from, next) => {
+  if (getToken()) {
+    if (!store.getters.roles.length) {
+      // 页面刷新后，重新拉取用户信息和权限
+      const { roles, permissions } = await store.dispatch('user/getInfo')
+      // 根据权限动态生成路由
+      const accessRoutes = await store.dispatch('permission/generateRoutes', roles)
+      router.addRoutes(accessRoutes) // 动态注入路由
+      next({ ...to, replace: true })
+    }
+    next()
+  }
+})
+```
+
+后端 `getInfo` 极其安全：**绝不依赖前端传来的用户 ID**，而是从 `SecurityContextHolder` 中拿到当前 Token 绑定的用户信息，反查数据库后返回。
+
+### getRouters — 动态构建菜单树
+
+后端根据当前用户的角色和权限，去 `sys_menu` 表查询有权访问的菜单节点，递归组装成树状 JSON 结构：
+
+```java
+// 菜单树递归构建核心逻辑
+public List<SysMenu> selectMenuTreeByUserId(Long userId) {
+    List<SysMenu> menus = menuMapper.selectMenuTreeAll();  // 查全量菜单
+    Set<Long> userMenuIds = getMenuIdsByUserId(userId);     // 用户有权访问的菜单 ID
+
+    // 递归过滤：只保留用户有权限的节点
+    return menus.stream()
+        .filter(m -> userMenuIds.contains(m.getMenuId()))
+        .map(m -> {
+            m.setChildren(buildChildren(m, userMenuIds));
+            return m;
+        })
+        .toList();
+}
+```
+
+返回的 JSON 结构示例：
+
+```json
+[
+  {
+    "name": "System",
+    "path": "/system",
+    "component": "Layout",
+    "meta": { "title": "系统管理", "icon": "system" },
+    "children": [
+      {
+        "name": "User",
+        "path": "user",
+        "component": "system/user/index",
+        "meta": { "title": "用户管理", "perms": ["system:user:list"] }
+      }
+    ]
+  }
+]
+```
+
+前端通过 `router.addRoute()` **动态注入到路由表**中，这从物理上杜绝了低权限用户通过手动修改浏览器 URL 越权访问高权限页面的可能。
+
+---
+
+## 阶段三：基于自定义 JWT 过滤器的拦截体系
+
+Spring Security 的核心是过滤器链。RuoYi 自定义了一个 `JwtAuthenticationTokenFilter`，在所有业务请求到达 Controller 之前进行全拦截。
+
+```java
+@Component
+public class JwtAuthenticationTokenFilter extends OncePerRequestFilter {
+
+    @Autowired
+    private TokenService tokenService;
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest request,
+                                    HttpServletResponse response,
+                                    FilterChain chain)
+            throws ServletException, IOException {
+
+        // 1. 从请求头 Authorization 解析 JWT → 拿 uuid → 查 Redis → 得 LoginUser
+        LoginUser loginUser = tokenService.getLoginUser(request);
+
+        // 2. 核心判断：Redis 中有用户 && 当前上下文还未注入认证信息
+        if (StringUtils.isNotNull(loginUser)
+                && StringUtils.isNull(SecurityUtils.getAuthentication())) {
+
+            // 3. 【滑动过期机制】
+            //    每次有效请求时，检查剩余有效期。如果低于阈值（如 20 分钟），
+            //    自动延长 Redis 中 Key 的 TTL（如再续 30 分钟），实现无感刷新。
+            tokenService.verifyToken(loginUser);
+
+            // 4. 重新组装认证令牌，注入用户拥有的权限列表
+            UsernamePasswordAuthenticationToken authenticationToken =
+                new UsernamePasswordAuthenticationToken(
+                    loginUser, null, loginUser.getAuthorities());
+
+            // 5. 组装请求的 Web 详细信息（如 IP、SessionID）
+            authenticationToken.setDetails(
+                new WebAuthenticationDetailsSource().buildDetails(request));
+
+            // 6. 注入当前线程上下文 → 后续 @PreAuthorize 注解才能生效
+            SecurityContextHolder.getContext().setAuthentication(authenticationToken);
+        }
+
+        // 7. 放行，进入下一个过滤器或目标 Controller
+        chain.doFilter(request, response);
+    }
+}
+```
+
+### 过滤器链顺序
+
+RuoYi 在 Spring Security 配置中插入自定义过滤器的位置非常关键：
+
+```
+请求 → HeaderWriterFilter → CorsFilter → JwtAuthenticationTokenFilter（自定义）
+     → UsernamePasswordAuthenticationFilter → ExceptionTranslationFilter
+     → FilterSecurityInterceptor → Controller
+```
+
+| 过滤器 | 作用 |
+|--------|------|
+| `JwtAuthenticationTokenFilter` | 从 Token 恢复用户登录状态到 SecurityContext |
+| `UsernamePasswordAuthenticationFilter` | 处理 `/login` 的账密认证 |
+| `FilterSecurityInterceptor` | 基于配置的 URL 权限规则进行拦截 |
+
+---
+
+## 权限控制体系
+
+### @PreAuthorize 注解校验
+
+```java
+@RestController
+@RequestMapping("/system/user")
+public class SysUserController {
+
+    @PreAuthorize("@ss.hasPermi('system:user:list')")
+    @GetMapping("/list")
+    public TableDataInfo list(SysUser user) {
+        // 只有拥有 system:user:list 权限的用户才能执行到这里
+        return userService.selectUserList(user);
+    }
+
+    @PreAuthorize("@ss.hasRole('admin')")
+    @DeleteMapping("/{userIds}")
+    public AjaxResult remove(@PathVariable Long[] userIds) {
+        // 只有 admin 角色才能删除用户
+        return userService.deleteUserByIds(userIds);
+    }
+}
+```
+
+### PermissionService（@ss）内部实现
+
+```java
+@Service("ss")
+public class PermissionService {
+
+    public boolean hasPermi(String permission) {
+        if (StringUtils.isEmpty(permission)) return false;
+
+        LoginUser loginUser = SecurityUtils.getLoginUser();
+        if (loginUser == null || CollectionUtils.isEmpty(loginUser.getPermissions())) {
+            return false;
+        }
+
+        // 超管特权硬编码：admin 角色直接放行所有权限检查
+        if (loginUser.getRoles().stream().anyMatch(r -> "admin".equals(r.getRoleKey()))) {
+            return true;
+        }
+
+        // 正常校验：判断用户权限列表是否包含目标权限标识
+        return loginUser.getPermissions().contains(permission);
+    }
+}
+```
+
+### 前端按钮级权限控制
+
+```vue
+<template>
+  <!-- v-hasPermi 指令：无权限时直接不渲染该按钮 -->
+  <el-button v-hasPermi="['system:user:add']" type="primary" @click="handleAdd">
+    新增
+  </el-button>
+  <el-button v-hasPermi="['system:user:edit']" @click="handleEdit">
+    修改
+  </el-button>
+  <el-button v-hasPermi="['system:user:remove']" @click="handleDelete">
+    删除
+  </el-button>
+</template>
+```
+
+`v-hasPermi` 指令会从 Vuex/Pinia 中取出当前用户的权限列表，与传入的数组做交集判断，无交集时直接 `removeChild` 该 DOM 节点。
+
+---
+
+## 核心避坑要点
+
+### 1. 双过期机制（JWT vs Redis）
+
+| 机制 | 过期方式 | 控制方 |
+|------|----------|--------|
+| JWT | 不设绝对过期（或极长） | 无法后端控制，只能等自然过期 |
+| Redis | TTL 30 分钟 + 滑动续期 | 后端随时可删除 Key 实现强制下线 |
+
+**优势**：管理员可以在后台直接 `DEL login_tokens:xxx`，用户立刻被踢下线。纯 JWT 方案做不到这一点。
+
+### 2. ThreadLocal 线程绑定
+
+`SecurityContextHolder` 底层默认基于 `ThreadLocal` 实现。在 Controller/Service 中如果开启了异步线程（`@Async` 或手动 `new Thread()`），新线程中**无法直接获取当前登录用户信息**，必须手动传递上下文：
+
+```java
+// 父线程传递上下文到子线程
+SecurityContext context = SecurityContextHolder.getContext();
+CompletableFuture.runAsync(() -> {
+    SecurityContextHolder.setContext(context);
+    // 现在可以正常获取 loginUser 了
+    LoginUser user = SecurityUtils.getLoginUser();
+    // 业务逻辑...
+}).thenRun(() -> SecurityContextHolder.clearContext()); // 子线程结束时清理
+```
+
+### 3. 超管特权硬编码
+
+在 `PermissionService` 中，RuoYi 硬编码了一行逻辑：**若当前用户角色编码是 `admin`，则直接放行所有权限检查。** 如果业务上需要限制超管的某些高危操作（如删除所有数据），必须去 `PermissionService.hasPermi()` 方法中修改此"特权"逻辑。
+
+### 4. 前端路由与后端菜单的一致性
+
+`getRouters` 返回的菜单路径必须与前端 `router/index.js` 中定义的组件路径**完全一致**。否则 `router.addRoute()` 会因为找不到对应 component 而报错。建议在项目的 `sys_menu` 表中统一维护菜单数据，避免前后端各管各的。
+
+---
+
+## 总结
+
+RuoYi 的认证授权体系可以概括为一条主线 + 三个核心设计：
+
+1. **一条主线**：JWT 传 uuid → Redis 存 LoginUser → SecurityContextHolder 绑线程
+
+2. **双过期设计**：JWT 不过期，Redis TTL 控制真正过期，解决主动踢人难题
+
+3. **权限三级控制**：
+   - **路由级**：`getRouters` 动态注入，无权限菜单直接不显示
+   - **按钮级**：`v-hasPermi` 指令，无权限按钮直接不渲染
+   - **接口级**：`@PreAuthorize("@ss.hasPermi(...)")`，无权限请求直接 403
+
+4. **滑动续期**：每次请求自动检查 Redis TTL，低于阈值自动续期，用户无感知
+
+记住一个调试技巧：遇到权限问题，先查 `SecurityContextHolder.getContext().getAuthentication()` 是否为空，再查 Redis 中 Token 对应的 Key 是否存在，最后查数据库中的权限数据是否正确。
