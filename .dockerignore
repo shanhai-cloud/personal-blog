@@ -1,0 +1,42 @@
+# 依赖
+node_modules
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# 构建产物
+.next
+.velite
+out
+
+# 版本控制
+.git
+.gitignore
+
+# IDE
+.idea
+.vscode
+*.swp
+*.swo
+
+# 环境变量（生产环境通过 docker-compose 或 CI 注入）
+.env
+.env.local
+.env.*.local
+
+# macOS
+.DS_Store
+
+# 日志
+logs
+*.log
+
+# Docker
+Dockerfile
+.dockerignore
+
+# 文档（非代码，不参与构建）
+doc
+
+# 原型/设计素材（不参与构建）
+原型.html

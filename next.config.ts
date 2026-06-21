@@ -1,6 +1,9 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
+  // BUILD_STATIC=true → 静态导出 (out/); 默认 → standalone (Docker/Node.js)
+  output: process.env.BUILD_STATIC === "true" ? "export" : "standalone",
+  images: process.env.BUILD_STATIC === "true" ? { unoptimized: true } : undefined,
   pageExtensions: ["ts", "tsx", "md", "mdx"],
   async headers() {
     return [
